@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.DS_Store
+.idea/
+.vscode/
+
+# MediaPipe task bundles, ~31 MB. Fetch with scripts/download_models.py
+models/*.task
+
+# Generated croquis
+captures/*
+!captures/.gitkeep
+
+# Training data and checkpoints for the conversion models
+data/
+checkpoints/
+*.pth
+*.onnx
+
+CLAUDE.md

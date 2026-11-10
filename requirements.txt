@@ -1,0 +1,9 @@
+# mediapipe 1.x only ships the Tasks API; the legacy mp.solutions namespace was
+# removed, so code written against mp.solutions.hands / mp.solutions.pose will not
+# import on this version.
+mediapipe>=1.2.0
+opencv-python>=4.9
+numpy>=1.26
+
+# tests
+pytest>=8.0
