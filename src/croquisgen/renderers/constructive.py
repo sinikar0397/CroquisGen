@@ -19,6 +19,8 @@ the order the plan lists them:
 4. 렌더링 - solid forms, not wireframes. Every form is collected with a depth,
    then painted far to near: filled with paper colour first, outlined second, so
    a nearer form hides the lines of whatever is behind it (painter's algorithm).
+   The hidden lines are not dropped but redrawn in a light ink, the way a
+   construction drawing keeps the far side of a form as a ghost line.
    Outlines carry the construction cues artists use: end caps whose roundness
    follows the foreshortening, drawn in full at the near end and as a half ring
    at the far end; cross-contour rings along the limbs; centre lines on head and
@@ -48,6 +50,8 @@ from .base import blank_paper, scaled_points, visible
 
 INK = config.INK_COLOR
 PAPER = config.PAPER_COLOR
+# Ink for lines that a nearer form hides: a third of the way from paper to ink.
+GHOST = tuple(int(p * 0.68 + i * 0.32) for p, i in zip(PAPER, INK))
 
 # --- canonical proportions, in head heights H (8-head figure) ----------------
 TORSO_H = 2.5           # shoulder centre -> hip centre
@@ -181,27 +185,38 @@ def _foreshortening(start: np.ndarray, end: np.ndarray, canonical: float) -> flo
 
 # --- stage 4: solid forms ----------------------------------------------------
 
-Painter = Callable[[np.ndarray], None]
+Fill = Callable[[np.ndarray], None]
+# stroke(canvas, ink, ghost): ghost=True draws the complete outline, hidden
+# halves included, for the light pass.
+Stroke = Callable[[np.ndarray, tuple, bool], None]
 
 
 class _Scene:
-    """Painter's algorithm over simple forms.
+    """Painter's algorithm over simple forms, with ghost lines.
 
-    Each form is a depth plus two painters. paint() runs them far to near, fill
-    then outline, so a nearer form's paper-coloured fill erases the lines of
-    anything behind it. That is the whole of the hidden-line removal.
+    Each form is a depth plus a fill and a stroke. paint() runs them far to near,
+    fill then outline, so a nearer form's paper-coloured fill erases the lines of
+    anything behind it. A second pass draws every outline in light ink on a clean
+    sheet, and the two are merged darkest-wins: visible lines stay ink, lines that
+    a fill erased come back as ghosts.
     """
 
     def __init__(self) -> None:
-        self._forms: list[tuple[float, Painter, Painter]] = []
+        self._forms: list[tuple[float, Fill, Stroke]] = []
 
-    def add(self, depth: float, fill: Painter, stroke: Painter) -> None:
+    def add(self, depth: float, fill: Fill, stroke: Stroke) -> None:
         self._forms.append((float(depth), fill, stroke))
 
     def paint(self, canvas: np.ndarray) -> None:
-        for _, fill, stroke in sorted(self._forms, key=lambda f: -f[0]):
+        ordered = sorted(self._forms, key=lambda f: -f[0])
+        for _, fill, stroke in ordered:
             fill(canvas)
-            stroke(canvas)
+            stroke(canvas, INK, False)
+        ghost = np.empty_like(canvas)
+        ghost[:] = PAPER
+        for _, _, stroke in ordered:
+            stroke(ghost, GHOST, True)
+        np.minimum(canvas, ghost, out=canvas)
 
 
 def _pt(p: np.ndarray) -> tuple[int, int]:
@@ -213,12 +228,12 @@ def _axes(a: float, b: float) -> tuple[int, int]:
 
 
 def _half_ellipse(canvas, centre, along, half_along: float, half_across: float,
-                  thickness: int, full: bool = False) -> None:
+                  thickness: int, ink=INK, full: bool = False) -> None:
     """Ellipse with its first axis on `along`; only the half displaced toward
     +along unless `full`. Every ring, cap and centre line is one of these."""
     angle = math.degrees(math.atan2(float(along[1]), float(along[0])))
     cv2.ellipse(canvas, _pt(centre), _axes(half_along, half_across), angle,
-                0 if full else -90, 360 if full else 90, INK, thickness, cv2.LINE_AA)
+                0 if full else -90, 360 if full else 90, ink, thickness, cv2.LINE_AA)
 
 
 def _add_cylinder(scene: _Scene, depth: float, start, end, r_start: float, r_end: float,
@@ -246,37 +261,41 @@ def _add_cylinder(scene: _Scene, depth: float, start, end, r_start: float, r_end
         for centre, r in ((start, r_start), (end, r_end)):
             cv2.ellipse(c, _pt(centre), _axes(r * squash, r), cap_angle, 0, 360, PAPER, -1, cv2.LINE_8)
 
-    def stroke(c):
+    def stroke(c, ink, ghost):
         for sign in (1, -1):
             cv2.line(c, _pt(start + normal * r_start * sign), _pt(end + normal * r_end * sign),
-                     INK, thick, cv2.LINE_AA)
+                     ink, thick, cv2.LINE_AA)
         if cap_start:
-            _half_ellipse(c, start, toward_far, r_start * squash, r_start, thick, full=not near_is_end)
+            _half_ellipse(c, start, toward_far, r_start * squash, r_start, thick, ink,
+                          full=ghost or not near_is_end)
         if cap_end:
-            _half_ellipse(c, end, toward_far, r_end * squash, r_end, thick, full=near_is_end)
+            _half_ellipse(c, end, toward_far, r_end * squash, r_end, thick, ink,
+                          full=ghost or near_is_end)
         for k in range(1, rings + 1):
             t = k / (rings + 1)
             r = r_start + (r_end - r_start) * t
-            _half_ellipse(c, start + direction * t, toward_far, r * squash, r, thin)
+            _half_ellipse(c, start + direction * t, toward_far, r * squash, r, thin, ink,
+                          full=ghost)
 
     scene.add(depth, fill, stroke)
 
 
 def _add_sphere(scene: _Scene, depth: float, centre, r: float, thickness: int) -> None:
     radius = max(2, int(r))
-    # A sphere's surface is nearer than its centre by r, which is what lets the
-    # ball of a joint sit on top of the cylinders that meet there.
-    scene.add(depth - r,
+    # The ball sits in the socket: pushed back by its radius so the cylinders
+    # meeting there paint over it, and only the part of the ball that protrudes
+    # past them keeps a full-ink outline. The rest comes back as a ghost line.
+    scene.add(depth + r,
               lambda c: cv2.circle(c, _pt(centre), radius, PAPER, -1, cv2.LINE_8),
-              lambda c: cv2.circle(c, _pt(centre), radius, INK, thickness, cv2.LINE_AA))
+              lambda c, ink, ghost: cv2.circle(c, _pt(centre), radius, ink, thickness, cv2.LINE_AA))
 
 
 def _add_ellipse(scene: _Scene, depth: float, centre, axes: tuple[int, int], angle: float,
-                 thick: int, extra: Painter | None = None) -> None:
-    def stroke(c):
-        cv2.ellipse(c, _pt(centre), axes, angle, 0, 360, INK, thick, cv2.LINE_AA)
+                 thick: int, extra: Stroke | None = None) -> None:
+    def stroke(c, ink, ghost):
+        cv2.ellipse(c, _pt(centre), axes, angle, 0, 360, ink, thick, cv2.LINE_AA)
         if extra:
-            extra(c)
+            extra(c, ink, ghost)
 
     scene.add(depth,
               lambda c: cv2.ellipse(c, _pt(centre), axes, angle, 0, 360, PAPER, -1, cv2.LINE_8),
@@ -284,13 +303,13 @@ def _add_ellipse(scene: _Scene, depth: float, centre, axes: tuple[int, int], ang
 
 
 def _add_polygon(scene: _Scene, depth: float, pts: np.ndarray, thick: int,
-                 extra: Painter | None = None) -> None:
+                 extra: Stroke | None = None) -> None:
     poly = pts.astype(np.int32)
 
-    def stroke(c):
-        cv2.polylines(c, [poly], True, INK, thick, cv2.LINE_AA)
+    def stroke(c, ink, ghost):
+        cv2.polylines(c, [poly], True, ink, thick, cv2.LINE_AA)
         if extra:
-            extra(c)
+            extra(c, ink, ghost)
 
     scene.add(depth, lambda c: cv2.fillPoly(c, [poly], PAPER, cv2.LINE_8), stroke)
 
@@ -311,10 +330,11 @@ def _add_ellipsoid(scene: _Scene, depth: float, centre, up, half_w: float, half_
     angle = math.degrees(math.atan2(float(right[1]), float(right[0])))
     side = 1.0 if facing >= 0 else -1.0
 
-    def lines(c):
-        _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin)
+    def lines(c, ink, ghost):
+        _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin, ink,
+                      full=ghost)
         _half_ellipse(c, centre + up * (half_h * ring_at), up * ring_toward,
-                      max(proj_w * ring_squash, proj_w * 0.12), proj_w, thin)
+                      max(proj_w * ring_squash, proj_w * 0.12), proj_w, thin, ink, full=ghost)
 
     _add_ellipse(scene, depth, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
 
@@ -470,10 +490,12 @@ class ConstructiveRenderer:
         eye_level = (float(np.dot((points[L_EYE] + points[R_EYE]) / 2 - centre, up))
                      if visible(result, L_EYE, R_EYE) else None)
 
-        def lines(c):
-            _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin)
+        def lines(c, ink, ghost):
+            _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin, ink,
+                          full=ghost)
             if eye_level is not None:
-                _half_ellipse(c, centre + up * eye_level, -up, proj_w * 0.18, proj_w * 0.95, thin)
+                _half_ellipse(c, centre + up * eye_level, -up, proj_w * 0.18, proj_w * 0.95,
+                              thin, ink, full=ghost)
 
         _add_ellipse(scene, z, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
 
@@ -522,7 +544,8 @@ class ConstructiveRenderer:
         palm = np.array([wrist_index, *thumb, *top, wrist_pinky])
         mid_a, mid_b = (wrist_index + top[0]) / 2, (wrist_pinky + top[-1]) / 2
         _add_polygon(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, thick,
-                     extra=lambda c: cv2.line(c, _pt(mid_a), _pt(mid_b), INK, thin, cv2.LINE_AA))
+                     extra=lambda c, ink, ghost: cv2.line(c, _pt(mid_a), _pt(mid_b), ink, thin,
+                                                          cv2.LINE_AA))
 
         for chain, segments in _HAND_CHAINS:
             _add_chain(scene, points, depth, chain, segments, P, thick, thin,
