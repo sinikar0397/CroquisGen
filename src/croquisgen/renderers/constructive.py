@@ -78,7 +78,8 @@ _BODY_JOINTS = {
 # Hand proportions, in palm lengths P (wrist -> middle MCP).
 PALM_WIDTH_P = 0.75     # index MCP -> pinky MCP
 _FINGER = ((0.42, 0.10, 0.085), (0.27, 0.085, 0.075), (0.22, 0.075, 0.065))
-_THUMB_CHAIN = ((1, 2, 3, 4), ((0.45, 0.14, 0.12), (0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))
+# The thumb starts at its MCP: the metacarpal (1 -> 2) is inside the palm mass.
+_THUMB_CHAIN = ((2, 3, 4), ((0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))
 # Index to pinky, in order: the palm's top edge is built from these bases.
 _FINGER_CHAINS = (
     ((5, 6, 7, 8), _FINGER),
@@ -318,6 +319,15 @@ def _add_ellipsoid(scene: _Scene, depth: float, centre, up, half_w: float, half_
     _add_ellipse(scene, depth, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
 
 
+def _base_edge(points, chain, r: float, order: np.ndarray) -> list[np.ndarray]:
+    """The two corners of a chain's first cylinder base, sorted along `order`."""
+    base = points[chain[0]]
+    axis = points[chain[1]] - base
+    axis = axis / (np.linalg.norm(axis) or 1.0)
+    normal = np.array([-axis[1], axis[0]], dtype=np.float32) * r
+    return sorted((base + normal, base - normal), key=lambda p: float(np.dot(p, order)))
+
+
 def _add_chain(scene: _Scene, points, depth, chain, segments, unit: float, thick: int,
                thin: int, *, rings: int, tips_only: bool, ok=lambda a, b: True) -> None:
     pairs = list(zip(chain, chain[1:]))
@@ -495,24 +505,23 @@ class ConstructiveRenderer:
         thick = max(2, int(round(P * 0.022)))
         thin = max(1, thick // 2)
 
-        # The palm's top edge is the row of finger bases: each finger's proximal
-        # cylinder starts on a segment across its MCP, and those segments, joined
-        # by short webs, are the palm's upper outline. So the palm's corners and
-        # the fingers' base corners are the same points.
+        # The palm's outline runs through the bases of the digits: each finger's
+        # proximal cylinder starts on a segment across its MCP, and those segments,
+        # joined by short webs, are the palm's upper edge; the thumb's base segment
+        # sits on the index-side edge, where the thenar bulges out. So the palm's
+        # corners and the digits' base corners are the same points.
         across = points[17] - points[5]
         across /= np.linalg.norm(across) or 1.0
         top: list[np.ndarray] = []
         for chain, segments in _FINGER_CHAINS:
-            base, nxt = points[chain[0]], points[chain[1]]
-            axis = nxt - base
-            axis = axis / (np.linalg.norm(axis) or 1.0)
-            normal = np.array([-axis[1], axis[0]], dtype=np.float32) * segments[0][1] * P
-            top += sorted((base + normal, base - normal), key=lambda p: float(np.dot(p, across)))
+            top += _base_edge(points, chain, segments[0][1] * P, across)
         wrist_index = points[0] - across * P * 0.28
         wrist_pinky = points[0] + across * P * 0.28
-        palm = np.array([wrist_index, *top, wrist_pinky])
+        thumb = _base_edge(points, _THUMB_CHAIN[0], _THUMB_CHAIN[1][0][1] * P,
+                           top[0] - wrist_index)
+        palm = np.array([wrist_index, *thumb, *top, wrist_pinky])
         mid_a, mid_b = (wrist_index + top[0]) / 2, (wrist_pinky + top[-1]) / 2
-        _add_polygon(scene, float(np.mean(depth[[0, 5, 9, 13, 17]])), palm, thick,
+        _add_polygon(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, thick,
                      extra=lambda c: cv2.line(c, _pt(mid_a), _pt(mid_b), INK, thin, cv2.LINE_AA))
 
         for chain, segments in _HAND_CHAINS:
