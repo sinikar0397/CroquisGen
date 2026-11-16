@@ -348,6 +348,36 @@ def _base_edge(points, chain, r: float, order: np.ndarray) -> list[np.ndarray]:
     return sorted((base + normal, base - normal), key=lambda p: float(np.dot(p, order)))
 
 
+def _palm_outline(points: np.ndarray, P: float) -> np.ndarray:
+    """The palm polygon, wrist corner -> (thumb base) -> finger bases -> wrist corner.
+
+    The outline runs through the bases of the digits: each finger's proximal
+    cylinder starts on a segment across its MCP, and those segments, joined by
+    short webs, are the palm's upper edge, so the palm's corners and the fingers'
+    base corners are the same points. The thumb's base joins the index-side edge
+    where the thenar bulges out - unless the thumb is folded across the palm, when
+    its MCP lies inside the outline and including it would make the polygon cross
+    itself; then the thumb just lies on top of the palm.
+    """
+    across = points[17] - points[5]
+    across = across / (np.linalg.norm(across) or 1.0)
+    top: list[np.ndarray] = []
+    for chain, segments in _FINGER_CHAINS:
+        top += _base_edge(points, chain, segments[0][1] * P, across)
+    wrist_index = points[0] - across * P * 0.28
+    wrist_pinky = points[0] + across * P * 0.28
+
+    edge = top[0] - wrist_index
+    def side(p) -> float:  # which side of the index-side edge p is on
+        d = p - wrist_index
+        return float(edge[0] * d[1] - edge[1] * d[0])
+    centre = points[[0, 5, 9, 13, 17]].mean(axis=0)
+    thumb_out = side(points[_THUMB_CHAIN[0][0]]) * side(centre) < 0
+    thumb = (_base_edge(points, _THUMB_CHAIN[0], _THUMB_CHAIN[1][0][1] * P, edge)
+             if thumb_out else [])
+    return np.array([wrist_index, *thumb, *top, wrist_pinky])
+
+
 def _add_chain(scene: _Scene, points, depth, chain, segments, unit: float, thick: int,
                thin: int, *, rings: int, tips_only: bool, ok=lambda a, b: True) -> None:
     pairs = list(zip(chain, chain[1:]))
@@ -527,22 +557,9 @@ class ConstructiveRenderer:
         thick = max(2, int(round(P * 0.022)))
         thin = max(1, thick // 2)
 
-        # The palm's outline runs through the bases of the digits: each finger's
-        # proximal cylinder starts on a segment across its MCP, and those segments,
-        # joined by short webs, are the palm's upper edge; the thumb's base segment
-        # sits on the index-side edge, where the thenar bulges out. So the palm's
-        # corners and the digits' base corners are the same points.
-        across = points[17] - points[5]
-        across /= np.linalg.norm(across) or 1.0
-        top: list[np.ndarray] = []
-        for chain, segments in _FINGER_CHAINS:
-            top += _base_edge(points, chain, segments[0][1] * P, across)
-        wrist_index = points[0] - across * P * 0.28
-        wrist_pinky = points[0] + across * P * 0.28
-        thumb = _base_edge(points, _THUMB_CHAIN[0], _THUMB_CHAIN[1][0][1] * P,
-                           top[0] - wrist_index)
-        palm = np.array([wrist_index, *thumb, *top, wrist_pinky])
-        mid_a, mid_b = (wrist_index + top[0]) / 2, (wrist_pinky + top[-1]) / 2
+        palm = _palm_outline(points, P)
+        # Mid-palm cross line between the two side edges (top[0] is palm[-9]).
+        mid_a, mid_b = (palm[0] + palm[-9]) / 2, (palm[-1] + palm[-2]) / 2
         _add_polygon(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, thick,
                      extra=lambda c, ink, ghost: cv2.line(c, _pt(mid_a), _pt(mid_b), ink, thin,
                                                           cv2.LINE_AA))
