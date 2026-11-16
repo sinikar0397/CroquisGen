@@ -61,3 +61,27 @@ def test_smoother_only_blends_across_advancing_timestamps():
     assert np.allclose(smoother.update(33, first), 0.5)
     # A long gap resets to the new input.
     assert np.array_equal(smoother.update(5000, second), second)
+
+
+def _flat_hand(thumb_mcp: tuple[float, float]) -> np.ndarray:
+    """Fingers straight up from a palm; only the thumb MCP position varies."""
+    pts = np.zeros((21, 2), dtype=np.float32)
+    pts[0] = (50, 90)
+    for base, x in ((5, 40), (9, 48), (13, 56), (17, 64)):
+        for i in range(4):
+            pts[base + i] = (x, 55 - 12 * i)
+    pts[1] = (44, 80)
+    pts[2] = thumb_mcp
+    pts[3] = pts[2] + (-6, -6)
+    pts[4] = pts[3] + (-5, -5)
+    return pts
+
+
+def test_palm_outline_includes_thumb_only_when_it_sticks_out():
+    from croquisgen.renderers.constructive import _palm_outline
+
+    spread = _palm_outline(_flat_hand((30, 70)), P=40.0)   # thumb beside the palm
+    folded = _palm_outline(_flat_hand((50, 70)), P=40.0)   # thumb MCP inside the palm
+    # 2 wrist corners + 4 fingers x 2 base corners, plus 2 for an abducted thumb.
+    assert len(folded) == 10
+    assert len(spread) == 12
