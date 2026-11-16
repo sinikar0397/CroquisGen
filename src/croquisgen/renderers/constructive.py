@@ -16,18 +16,23 @@ the order the plan lists them:
    detection error, not a long arm: the distal joint is pulled in and the rest of
    the chain moves with it. A limb that projects shorter is foreshortened, which
    is real and is drawn as such.
-4. 렌더링 - outlines plus the construction lines artists actually use: end caps
-   whose roundness follows the foreshortening, drawn in full at the near end and
-   as a half ring at the far end; cross-contour rings along the limbs; centre
-   lines on head and torso that shift toward the side facing the camera.
+4. 렌더링 - solid forms, not wireframes. Every form is collected with a depth,
+   then painted far to near: filled with paper colour first, outlined second, so
+   a nearer form hides the lines of whatever is behind it (painter's algorithm).
+   Outlines carry the construction cues artists use: end caps whose roundness
+   follows the foreshortening, drawn in full at the near end and as a half ring
+   at the far end; cross-contour rings along the limbs; centre lines on head and
+   torso that shift toward the side facing the camera.
 
-Depth comes from the landmark z, which MediaPipe scales like x. It decides only
-which end of a limb is nearer and which way a mass faces, so its noise is far
-less visible than if it drove the geometry directly.
+Depth comes from the landmark z, which MediaPipe scales like x. It decides the
+paint order, which end of a limb is nearer and which way a mass faces, so its
+noise shows up as an occasional swap of two forms at nearly the same depth, not
+as distorted geometry.
 """
 from __future__ import annotations
 
 import math
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -40,6 +45,9 @@ from ..types import (
     R_WRIST, Target,
 )
 from .base import blank_paper, scaled_points, visible
+
+INK = config.INK_COLOR
+PAPER = config.PAPER_COLOR
 
 # --- canonical proportions, in head heights H (8-head figure) ----------------
 TORSO_H = 2.5           # shoulder centre -> hip centre
@@ -70,13 +78,15 @@ _BODY_JOINTS = {
 # Hand proportions, in palm lengths P (wrist -> middle MCP).
 PALM_WIDTH_P = 0.75     # index MCP -> pinky MCP
 _FINGER = ((0.42, 0.10, 0.085), (0.27, 0.085, 0.075), (0.22, 0.075, 0.065))
-_HAND_CHAINS = (
-    ((1, 2, 3, 4), ((0.45, 0.14, 0.12), (0.33, 0.12, 0.10), (0.27, 0.10, 0.085))),
+_THUMB_CHAIN = ((1, 2, 3, 4), ((0.45, 0.14, 0.12), (0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))
+# Index to pinky, in order: the palm's top edge is built from these bases.
+_FINGER_CHAINS = (
     ((5, 6, 7, 8), _FINGER),
     ((9, 10, 11, 12), ((0.46, 0.10, 0.085), (0.30, 0.085, 0.075), (0.24, 0.075, 0.065))),
     ((13, 14, 15, 16), _FINGER),
     ((17, 18, 19, 20), ((0.34, 0.09, 0.075), (0.22, 0.075, 0.065), (0.20, 0.065, 0.055))),
 )
+_HAND_CHAINS = (_THUMB_CHAIN, *_FINGER_CHAINS)
 
 
 # --- stage 1: preprocessing --------------------------------------------------
@@ -168,10 +178,37 @@ def _foreshortening(start: np.ndarray, end: np.ndarray, canonical: float) -> flo
     return math.sqrt(1.0 - ratio * ratio)
 
 
-# --- stage 4: drawing primitives ---------------------------------------------
+# --- stage 4: solid forms ----------------------------------------------------
+
+Painter = Callable[[np.ndarray], None]
+
+
+class _Scene:
+    """Painter's algorithm over simple forms.
+
+    Each form is a depth plus two painters. paint() runs them far to near, fill
+    then outline, so a nearer form's paper-coloured fill erases the lines of
+    anything behind it. That is the whole of the hidden-line removal.
+    """
+
+    def __init__(self) -> None:
+        self._forms: list[tuple[float, Painter, Painter]] = []
+
+    def add(self, depth: float, fill: Painter, stroke: Painter) -> None:
+        self._forms.append((float(depth), fill, stroke))
+
+    def paint(self, canvas: np.ndarray) -> None:
+        for _, fill, stroke in sorted(self._forms, key=lambda f: -f[0]):
+            fill(canvas)
+            stroke(canvas)
+
 
 def _pt(p: np.ndarray) -> tuple[int, int]:
     return int(round(float(p[0]))), int(round(float(p[1])))
+
+
+def _axes(a: float, b: float) -> tuple[int, int]:
+    return max(1, int(round(a))), max(1, int(round(b)))
 
 
 def _half_ellipse(canvas, centre, along, half_along: float, half_across: float,
@@ -179,14 +216,13 @@ def _half_ellipse(canvas, centre, along, half_along: float, half_across: float,
     """Ellipse with its first axis on `along`; only the half displaced toward
     +along unless `full`. Every ring, cap and centre line is one of these."""
     angle = math.degrees(math.atan2(float(along[1]), float(along[0])))
-    axes = (max(1, int(round(half_along))), max(1, int(round(half_across))))
-    cv2.ellipse(canvas, _pt(centre), axes, angle, 0 if full else -90, 360 if full else 90,
-                config.INK_COLOR, thickness, cv2.LINE_AA)
+    cv2.ellipse(canvas, _pt(centre), _axes(half_along, half_across), angle,
+                0 if full else -90, 360 if full else 90, INK, thickness, cv2.LINE_AA)
 
 
-def _cylinder(canvas, start, end, r_start: float, r_end: float, squash: float,
-              near_is_end: bool, thick: int, thin: int, *,
-              cap_start: bool = True, cap_end: bool = True, rings: int = 0) -> None:
+def _add_cylinder(scene: _Scene, depth: float, start, end, r_start: float, r_end: float,
+                  squash: float, near_is_end: bool, thick: int, thin: int, *,
+                  cap_start: bool = True, cap_end: bool = True, rings: int = 0) -> None:
     """A tapered tube with the cues that make it read as a solid.
 
     The cap at the near end is a full ellipse; the far cap and any mid rings show
@@ -199,39 +235,68 @@ def _cylinder(canvas, start, end, r_start: float, r_end: float, squash: float,
         return
     axis = direction / length
     normal = np.array([-axis[1], axis[0]], dtype=np.float32)
-    for sign in (1, -1):
-        cv2.line(canvas, _pt(start + normal * r_start * sign), _pt(end + normal * r_end * sign),
-                 config.INK_COLOR, thick, cv2.LINE_AA)
-
     toward_far = -axis if near_is_end else axis
-    if cap_start:
-        _half_ellipse(canvas, start, toward_far, r_start * squash, r_start, thick,
-                      full=not near_is_end)
-    if cap_end:
-        _half_ellipse(canvas, end, toward_far, r_end * squash, r_end, thick, full=near_is_end)
-    for k in range(1, rings + 1):
-        t = k / (rings + 1)
-        r = r_start + (r_end - r_start) * t
-        _half_ellipse(canvas, start + direction * t, toward_far, r * squash, r, thin)
+    quad = np.array([start + normal * r_start, end + normal * r_end,
+                     end - normal * r_end, start - normal * r_start], dtype=np.int32)
+    cap_angle = math.degrees(math.atan2(float(axis[1]), float(axis[0]))) + 90
+
+    def fill(c):
+        cv2.fillConvexPoly(c, quad, PAPER, cv2.LINE_8)
+        for centre, r in ((start, r_start), (end, r_end)):
+            cv2.ellipse(c, _pt(centre), _axes(r * squash, r), cap_angle, 0, 360, PAPER, -1, cv2.LINE_8)
+
+    def stroke(c):
+        for sign in (1, -1):
+            cv2.line(c, _pt(start + normal * r_start * sign), _pt(end + normal * r_end * sign),
+                     INK, thick, cv2.LINE_AA)
+        if cap_start:
+            _half_ellipse(c, start, toward_far, r_start * squash, r_start, thick, full=not near_is_end)
+        if cap_end:
+            _half_ellipse(c, end, toward_far, r_end * squash, r_end, thick, full=near_is_end)
+        for k in range(1, rings + 1):
+            t = k / (rings + 1)
+            r = r_start + (r_end - r_start) * t
+            _half_ellipse(c, start + direction * t, toward_far, r * squash, r, thin)
+
+    scene.add(depth, fill, stroke)
 
 
-def _draw_chain(canvas, points, depth, chain, segments, unit: float, thick: int, thin: int,
-                *, rings: int, tips_only: bool, ok=lambda a, b: True) -> None:
-    pairs = list(zip(chain, chain[1:]))
-    for i, ((a, b), (length, r0, r1)) in enumerate(zip(pairs, segments)):
-        if not ok(a, b):
-            continue
-        last = i == len(pairs) - 1
-        _cylinder(
-            canvas, points[a], points[b], r0 * unit, r1 * unit,
-            squash=_foreshortening(points[a], points[b], length * unit),
-            near_is_end=bool(depth[b] < depth[a]), thick=thick, thin=thin,
-            cap_start=not tips_only, cap_end=last or not tips_only, rings=rings,
-        )
+def _add_sphere(scene: _Scene, depth: float, centre, r: float, thickness: int) -> None:
+    radius = max(2, int(r))
+    # A sphere's surface is nearer than its centre by r, which is what lets the
+    # ball of a joint sit on top of the cylinders that meet there.
+    scene.add(depth - r,
+              lambda c: cv2.circle(c, _pt(centre), radius, PAPER, -1, cv2.LINE_8),
+              lambda c: cv2.circle(c, _pt(centre), radius, INK, thickness, cv2.LINE_AA))
 
 
-def _mass(canvas, centre, up, half_w: float, half_h: float, depth: float, facing: float,
-          thick: int, thin: int, ring_at: float, ring_squash: float, ring_toward: float) -> None:
+def _add_ellipse(scene: _Scene, depth: float, centre, axes: tuple[int, int], angle: float,
+                 thick: int, extra: Painter | None = None) -> None:
+    def stroke(c):
+        cv2.ellipse(c, _pt(centre), axes, angle, 0, 360, INK, thick, cv2.LINE_AA)
+        if extra:
+            extra(c)
+
+    scene.add(depth,
+              lambda c: cv2.ellipse(c, _pt(centre), axes, angle, 0, 360, PAPER, -1, cv2.LINE_8),
+              stroke)
+
+
+def _add_polygon(scene: _Scene, depth: float, pts: np.ndarray, thick: int,
+                 extra: Painter | None = None) -> None:
+    poly = pts.astype(np.int32)
+
+    def stroke(c):
+        cv2.polylines(c, [poly], True, INK, thick, cv2.LINE_AA)
+        if extra:
+            extra(c)
+
+    scene.add(depth, lambda c: cv2.fillPoly(c, [poly], PAPER, cv2.LINE_8), stroke)
+
+
+def _add_ellipsoid(scene: _Scene, depth: float, centre, up, half_w: float, half_h: float,
+                   depth_r: float, facing: float, thick: int, thin: int,
+                   ring_at: float, ring_squash: float, ring_toward: float) -> None:
     """An ellipsoid: outline, a meridian centre line, and one latitude ring.
 
     `facing` is sin(yaw) along `right`; it widens the silhouette by the ellipsoid's
@@ -241,14 +306,33 @@ def _mass(canvas, centre, up, half_w: float, half_h: float, depth: float, facing
     """
     right = np.array([-up[1], up[0]], dtype=np.float32)
     facing = max(-1.0, min(1.0, facing))
-    proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth ** 2 * facing ** 2)
+    proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth_r ** 2 * facing ** 2)
     angle = math.degrees(math.atan2(float(right[1]), float(right[0])))
-    cv2.ellipse(canvas, _pt(centre), (max(1, int(proj_w)), max(1, int(half_h))), angle,
-                0, 360, config.INK_COLOR, thick, cv2.LINE_AA)
     side = 1.0 if facing >= 0 else -1.0
-    _half_ellipse(canvas, centre, right * side, abs(facing) * depth, half_h, thin)
-    _half_ellipse(canvas, centre + up * (half_h * ring_at), up * ring_toward,
-                  max(proj_w * ring_squash, proj_w * 0.12), proj_w, thin)
+
+    def lines(c):
+        _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin)
+        _half_ellipse(c, centre + up * (half_h * ring_at), up * ring_toward,
+                      max(proj_w * ring_squash, proj_w * 0.12), proj_w, thin)
+
+    _add_ellipse(scene, depth, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
+
+
+def _add_chain(scene: _Scene, points, depth, chain, segments, unit: float, thick: int,
+               thin: int, *, rings: int, tips_only: bool, ok=lambda a, b: True) -> None:
+    pairs = list(zip(chain, chain[1:]))
+    for i, ((a, b), (length, r0, r1)) in enumerate(zip(pairs, segments)):
+        if not ok(a, b):
+            continue
+        last = i == len(pairs) - 1
+        _add_cylinder(
+            scene, (depth[a] + depth[b]) / 2, points[a], points[b], r0 * unit, r1 * unit,
+            squash=_foreshortening(points[a], points[b], length * unit),
+            near_is_end=bool(depth[b] < depth[a]), thick=thick, thin=thin,
+            # In tips_only mode the base of the chain still gets its cap: that
+            # line is the finger's root on the palm, shared with the palm outline.
+            cap_start=i == 0 or not tips_only, cap_end=last or not tips_only, rings=rings,
+        )
 
 
 # --- the renderer -------------------------------------------------------------
@@ -264,15 +348,17 @@ class ConstructiveRenderer:
         self, result: PerceptionResult, target: Target, size: tuple[int, int]
     ) -> np.ndarray:
         canvas = blank_paper(size)
+        scene = _Scene()
         if target is Target.HAND:
-            self._draw_hand(canvas, result, size)
+            self._build_hand(scene, result, size)
         else:
-            self._draw_body(canvas, result, size)
+            self._build_body(scene, result, size)
+        scene.paint(canvas)
         return canvas
 
     # -- full body ---------------------------------------------------------
 
-    def _draw_body(self, canvas, result: PerceptionResult, size: tuple[int, int]) -> None:
+    def _build_body(self, scene: _Scene, result: PerceptionResult, size: tuple[int, int]) -> None:
         if result.pose is None:
             return
         pose = self._pose_filter.update(result.timestamp_ms, result.pose)
@@ -289,17 +375,17 @@ class ConstructiveRenderer:
         shoulders = (points[L_SHOULDER] + points[R_SHOULDER]) / 2
         if seen(L_HIP, R_HIP):
             hips = (points[L_HIP] + points[R_HIP]) / 2
-            self._torso(canvas, points, depth, shoulders, hips, H, thick, thin)
+            self._torso(scene, points, depth, shoulders, hips, H, thick, thin)
             up = shoulders - hips
         else:
             up = np.array([0.0, -1.0], dtype=np.float32)
         up = up / (np.linalg.norm(up) or 1.0)
 
-        self._head(canvas, points, depth, result, shoulders, up, H, thick, thin)
+        self._head(scene, points, depth, result, shoulders, up, H, thick, thin)
 
         for chain, segments in _BODY_CHAINS:
-            _draw_chain(canvas, points, depth, chain, segments, H, thick, thin,
-                        rings=1, tips_only=False, ok=seen)
+            _add_chain(scene, points, depth, chain, segments, H, thick, thin,
+                       rings=1, tips_only=False, ok=seen)
 
         # Hands as mittens, feet as wedges: enough to show where the limb ends and
         # which way the extremity points, without competing with hand mode.
@@ -311,19 +397,19 @@ class ConstructiveRenderer:
                 # A hand pointed at the camera is already told by the full wrist
                 # cap; a mitten on top of it just stacks a third circle there.
                 if length > H * 0.25:
-                    _half_ellipse(canvas, (points[wrist] + tip) / 2, along / length,
-                                  max(length / 2, H * 0.2), H * 0.2, thick, full=True)
+                    _add_ellipse(scene, depth[wrist], (points[wrist] + tip) / 2,
+                                 _axes(length / 2, H * 0.2),
+                                 math.degrees(math.atan2(float(along[1]), float(along[0]))), thick)
         for ankle, heel, toe in ((L_ANKLE, L_HEEL, L_FOOT_INDEX), (R_ANKLE, R_HEEL, R_FOOT_INDEX)):
             if seen(ankle, heel, toe):
-                wedge = np.array([points[ankle], points[heel], points[toe]], dtype=np.int32)
-                cv2.polylines(canvas, [wedge], True, config.INK_COLOR, thick, cv2.LINE_AA)
+                _add_polygon(scene, depth[ankle],
+                             np.array([points[ankle], points[heel], points[toe]]), thick)
 
         for idx, r in _BODY_JOINTS.items():
             if seen(idx):
-                cv2.circle(canvas, _pt(points[idx]), max(2, int(r * H)), config.INK_COLOR,
-                           thick, cv2.LINE_AA)
+                _add_sphere(scene, depth[idx], points[idx], r * H, thick)
 
-    def _torso(self, canvas, points, depth, shoulders, hips, H, thick, thin) -> None:
+    def _torso(self, scene, points, depth, shoulders, hips, H, thick, thin) -> None:
         spine = hips - shoulders
         length = float(np.linalg.norm(spine)) or 1.0
         up = -spine / length
@@ -338,25 +424,28 @@ class ConstructiveRenderer:
             return toward_b * (1.0 if float(np.dot(ab, right)) >= 0 else -1.0)
 
         # Pitch: leaning toward the camera tilts the horizontal cross-sections open.
-        dz = float(depth[L_HIP] + depth[R_HIP] - depth[L_SHOULDER] - depth[R_SHOULDER]) / 2
+        z_shoulders = float(depth[L_SHOULDER] + depth[R_SHOULDER]) / 2
+        z_hips = float(depth[L_HIP] + depth[R_HIP]) / 2
+        dz = z_hips - z_shoulders
         pitch = abs(dz) / math.hypot(length, dz)
         ring_toward = -1.0 if dz > 0 else 1.0  # visible half faces away from the near end
 
         # Ribcage and pelvis as separate masses; the waist between them is where
         # the body twists, which is the point of drawing them apart.
-        _mass(canvas, shoulders + spine * 0.34, up, H * 0.72, H * 0.85, H * 0.55,
-              facing(L_SHOULDER, R_SHOULDER), thick, thin,
-              ring_at=-0.6, ring_squash=pitch, ring_toward=ring_toward)
-        _mass(canvas, shoulders + spine * 0.86, up, H * 0.60, H * 0.45, H * 0.50,
-              facing(L_HIP, R_HIP), thick, thin,
-              ring_at=0.0, ring_squash=pitch, ring_toward=ring_toward)
-        cv2.line(canvas, _pt(shoulders), _pt(hips), config.INK_COLOR, thin, cv2.LINE_AA)
+        _add_ellipsoid(scene, z_shoulders, shoulders + spine * 0.34, up, H * 0.72, H * 0.85,
+                       H * 0.55, facing(L_SHOULDER, R_SHOULDER), thick, thin,
+                       ring_at=-0.6, ring_squash=pitch, ring_toward=ring_toward)
+        _add_ellipsoid(scene, z_hips, shoulders + spine * 0.86, up, H * 0.60, H * 0.45,
+                       H * 0.50, facing(L_HIP, R_HIP), thick, thin,
+                       ring_at=0.0, ring_squash=pitch, ring_toward=ring_toward)
 
-    def _head(self, canvas, points, depth, result, shoulders, up, H, thick, thin) -> None:
+    def _head(self, scene, points, depth, result, shoulders, up, H, thick, thin) -> None:
         if visible(result, L_EAR, R_EAR):
             centre = (points[L_EAR] + points[R_EAR]) / 2
+            z = float(depth[L_EAR] + depth[R_EAR]) / 2
         elif visible(result, NOSE):
             centre = points[NOSE] + up * H * 0.15
+            z = float(depth[NOSE])
         else:
             return
         right = np.array([-up[1], up[0]], dtype=np.float32)
@@ -367,25 +456,30 @@ class ConstructiveRenderer:
         facing = max(-1.0, min(1.0, offset / depth_r))
         proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth_r ** 2 * facing ** 2)
         angle = math.degrees(math.atan2(float(right[1]), float(right[0])))
-        cv2.ellipse(canvas, _pt(centre), (max(1, int(proj_w)), max(1, int(half_h))), angle,
-                    0, 360, config.INK_COLOR, thick, cv2.LINE_AA)
         side = 1.0 if offset >= 0 else -1.0
-        _half_ellipse(canvas, centre, right * side, abs(facing) * depth_r, half_h, thin)
-        if visible(result, L_EYE, R_EYE):
-            level = float(np.dot((points[L_EYE] + points[R_EYE]) / 2 - centre, up))
-            _half_ellipse(canvas, centre + up * level, -up, proj_w * 0.18, proj_w * 0.95, thin)
+        eye_level = (float(np.dot((points[L_EYE] + points[R_EYE]) / 2 - centre, up))
+                     if visible(result, L_EYE, R_EYE) else None)
+
+        def lines(c):
+            _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin)
+            if eye_level is not None:
+                _half_ellipse(c, centre + up * eye_level, -up, proj_w * 0.18, proj_w * 0.95, thin)
+
+        _add_ellipse(scene, z, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
 
         # Neck: a short cylinder from under the skull to the shoulder line. A head
         # further than 1.5 H from the shoulders is a partial or mis-detected pose,
         # and a long neck would only advertise it.
         if np.linalg.norm(centre - shoulders) <= H * 1.5:
-            _cylinder(canvas, centre - up * half_h * 0.9, shoulders, H * 0.2, H * 0.22,
-                      squash=0.0, near_is_end=False, thick=thick, thin=thin,
-                      cap_start=False, cap_end=False)
+            z_shoulders = float(depth[L_SHOULDER] + depth[R_SHOULDER]) / 2
+            # Just behind both, so the skull and the ribcage cover its ends.
+            _add_cylinder(scene, max(z, z_shoulders) + 1.0, centre - up * half_h * 0.9,
+                          shoulders, H * 0.2, H * 0.22, squash=0.0, near_is_end=False,
+                          thick=thick, thin=thin, cap_start=False, cap_end=False)
 
     # -- hand ----------------------------------------------------------------
 
-    def _draw_hand(self, canvas, result: PerceptionResult, size: tuple[int, int]) -> None:
+    def _build_hand(self, scene: _Scene, result: PerceptionResult, size: tuple[int, int]) -> None:
         if result.hand is None:
             return
         hand = self._hand_filter.update(result.timestamp_ms, result.hand)
@@ -401,23 +495,29 @@ class ConstructiveRenderer:
         thick = max(2, int(round(P * 0.022)))
         thin = max(1, thick // 2)
 
-        # Palm as a slab: knuckle line across the MCPs, two corners at the wrist, and
-        # a cross line at mid-palm. The thenar pad is the one round mass on it.
-        across = points[5] - points[17]
+        # The palm's top edge is the row of finger bases: each finger's proximal
+        # cylinder starts on a segment across its MCP, and those segments, joined
+        # by short webs, are the palm's upper outline. So the palm's corners and
+        # the fingers' base corners are the same points.
+        across = points[17] - points[5]
         across /= np.linalg.norm(across) or 1.0
-        wrist_i = points[0] + across * P * 0.28
-        wrist_p = points[0] - across * P * 0.28
-        slab = np.array([wrist_i, points[5], points[9], points[13], points[17], wrist_p])
-        cv2.polylines(canvas, [slab.astype(np.int32)], True, config.INK_COLOR, thick, cv2.LINE_AA)
-        cv2.line(canvas, _pt((wrist_i + points[5]) / 2), _pt((wrist_p + points[17]) / 2),
-                 config.INK_COLOR, thin, cv2.LINE_AA)
-        cv2.circle(canvas, _pt((points[1] + points[2]) / 2), max(2, int(P * 0.2)),
-                   config.INK_COLOR, thin, cv2.LINE_AA)
+        top: list[np.ndarray] = []
+        for chain, segments in _FINGER_CHAINS:
+            base, nxt = points[chain[0]], points[chain[1]]
+            axis = nxt - base
+            axis = axis / (np.linalg.norm(axis) or 1.0)
+            normal = np.array([-axis[1], axis[0]], dtype=np.float32) * segments[0][1] * P
+            top += sorted((base + normal, base - normal), key=lambda p: float(np.dot(p, across)))
+        wrist_index = points[0] - across * P * 0.28
+        wrist_pinky = points[0] + across * P * 0.28
+        palm = np.array([wrist_index, *top, wrist_pinky])
+        mid_a, mid_b = (wrist_index + top[0]) / 2, (wrist_pinky + top[-1]) / 2
+        _add_polygon(scene, float(np.mean(depth[[0, 5, 9, 13, 17]])), palm, thick,
+                     extra=lambda c: cv2.line(c, _pt(mid_a), _pt(mid_b), INK, thin, cv2.LINE_AA))
 
         for chain, segments in _HAND_CHAINS:
-            _draw_chain(canvas, points, depth, chain, segments, P, thick, thin,
-                        rings=0, tips_only=True)
+            _add_chain(scene, points, depth, chain, segments, P, thick, thin,
+                       rings=0, tips_only=True)
             # Spheres at every finger joint, the reference-drawing convention.
             for idx, (_, r0, _) in zip(chain[1:-1], segments[1:]):
-                cv2.circle(canvas, _pt(points[idx]), max(2, int(r0 * P * 1.2)),
-                           config.INK_COLOR, thin, cv2.LINE_AA)
+                _add_sphere(scene, depth[idx], points[idx], r0 * P * 1.05, thin)
