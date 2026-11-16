@@ -1,7 +1,5 @@
-"""Constructive anatomy: the pure geometry behind the drawing.
-
-    python -m pytest tests -q
-"""
+# 인체 도형화 렌더러의 기하 함수 테스트 (카메라/모델 필요 없음)
+#   python -m pytest tests -q
 from __future__ import annotations
 
 import sys
@@ -18,35 +16,34 @@ from croquisgen.renderers.constructive import (  # noqa: E402
     _Smoother,
     _correct_proportions,
     _foreshortening,
+    _palm_outline,
 )
 from croquisgen.types import L_ELBOW, L_INDEX, L_PINKY, L_SHOULDER, L_WRIST  # noqa: E402
 
 
 def test_overlong_forearm_is_pulled_in_and_hand_follows():
-    unit = 10.0  # head height in px; canonical forearm is 1.25 * unit
+    unit = 10.0  #머리 높이 px. 표준 전완 길이 = 1.25 * unit
     points = np.zeros((33, 2), dtype=np.float32)
     points[L_SHOULDER] = (0, 0)
     points[L_ELBOW] = (0, 15)
-    points[L_WRIST] = (0, 15 + 60)      # 4.8 heads: a detection error
+    points[L_WRIST] = (0, 15 + 60)  #4.8H짜리 전완 -> 검출 오류
     points[L_PINKY] = points[L_INDEX] = (0, 80)
 
     fixed = _correct_proportions(points, _BODY_CHAINS, unit, _BODY_FOLLOWERS)
 
     forearm = np.linalg.norm(fixed[L_WRIST] - fixed[L_ELBOW])
     assert forearm <= 1.25 * unit * LENGTH_TOLERANCE + 1e-4
-    # Upper arm was plausible and must not move.
-    assert np.allclose(fixed[L_ELBOW], points[L_ELBOW])
-    # The hand points move with the wrist, keeping their offset from it.
+    assert np.allclose(fixed[L_ELBOW], points[L_ELBOW])  #상완은 정상이라 안 움직여야 함
+    # 손 점들은 손목이랑 같이 움직여서 상대 위치 유지
     assert np.allclose(fixed[L_PINKY] - fixed[L_WRIST], points[L_PINKY] - points[L_WRIST])
 
 
 def test_foreshortening_follows_projected_length():
     a = np.zeros(2, dtype=np.float32)
-    assert _foreshortening(a, np.array([10.0, 0.0]), canonical=10.0) == 0.0
+    assert _foreshortening(a, np.array([10.0, 0.0]), canonical=10.0) == 0.0  #화면에 누움
     assert abs(_foreshortening(a, np.array([5.0, 0.0]), canonical=10.0) - 0.866) < 1e-3
-    assert _foreshortening(a, a, canonical=10.0) == 1.0
-    # Longer than canonical never goes negative.
-    assert _foreshortening(a, np.array([20.0, 0.0]), canonical=10.0) == 0.0
+    assert _foreshortening(a, a, canonical=10.0) == 1.0  #카메라 정면
+    assert _foreshortening(a, np.array([20.0, 0.0]), canonical=10.0) == 0.0  #표준보다 길어도 음수 X
 
 
 def test_smoother_only_blends_across_advancing_timestamps():
@@ -55,16 +52,12 @@ def test_smoother_only_blends_across_advancing_timestamps():
     second = np.ones((3, 3), dtype=np.float32)
 
     assert np.array_equal(smoother.update(0, first), first)
-    # Same timestamp again (a still image, a test): no blending.
-    assert np.array_equal(smoother.update(0, second), second)
-    # Advancing timestamp: halfway between.
-    assert np.allclose(smoother.update(33, first), 0.5)
-    # A long gap resets to the new input.
-    assert np.array_equal(smoother.update(5000, second), second)
+    assert np.array_equal(smoother.update(0, second), second)  #같은 timestamp(정지 이미지) -> 섞지 않음
+    assert np.allclose(smoother.update(33, first), 0.5)  #다음 프레임 -> 절반씩
+    assert np.array_equal(smoother.update(5000, second), second)  #오래 끊기면 리셋
 
 
-def _flat_hand(thumb_mcp: tuple[float, float]) -> np.ndarray:
-    """Fingers straight up from a palm; only the thumb MCP position varies."""
+def _flat_hand(thumb_mcp):  #손가락은 위로 쭉 편 손. 엄지 MCP 위치만 바꿔서 씀
     pts = np.zeros((21, 2), dtype=np.float32)
     pts[0] = (50, 90)
     for base, x in ((5, 40), (9, 48), (13, 56), (17, 64)):
@@ -78,10 +71,8 @@ def _flat_hand(thumb_mcp: tuple[float, float]) -> np.ndarray:
 
 
 def test_palm_outline_includes_thumb_only_when_it_sticks_out():
-    from croquisgen.renderers.constructive import _palm_outline
-
-    spread = _palm_outline(_flat_hand((30, 70)), P=40.0)   # thumb beside the palm
-    folded = _palm_outline(_flat_hand((50, 70)), P=40.0)   # thumb MCP inside the palm
-    # 2 wrist corners + 4 fingers x 2 base corners, plus 2 for an abducted thumb.
+    spread = _palm_outline(_flat_hand((30, 70)), P=40.0)  #엄지가 손바닥 옆으로 나감
+    folded = _palm_outline(_flat_hand((50, 70)), P=40.0)  #엄지 MCP가 손바닥 안
+    # 손목 모서리 2 + 손가락 4개 x 밑동 2 = 10, 엄지가 나가 있으면 +2
     assert len(folded) == 10
     assert len(spread) == 12

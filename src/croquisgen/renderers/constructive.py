@@ -1,40 +1,10 @@
-"""Constructive anatomy - the body as spheres, cylinders and ellipsoids.
-
-Owner: 3802 김민재.
-
-No learned model; it is geometry driven by the detected joints. Four stages, in
-the order the plan lists them:
-
-1. 골격 전처리 - landmarks are smoothed across frames (z is several times noisier
-   than xy and gets a heavier filter) and a body unit, the head height H, is
-   estimated from the torso. Every size below is a multiple of H taken from an
-   8-head figure, never the raw distance between two detected joints.
-2. 도형 생성 - head, ribcage and pelvis as ellipsoids, joints as spheres, limbs
-   as tapered cylinders. Centre, size and rotation come from the joints plus the
-   canonical proportions.
-3. 인체구조 보정 - a limb that projects longer than its canonical length is a
-   detection error, not a long arm: the distal joint is pulled in and the rest of
-   the chain moves with it. A limb that projects shorter is foreshortened, which
-   is real and is drawn as such.
-4. 렌더링 - solid forms, not wireframes. Every form is collected with a depth,
-   then painted far to near: filled with paper colour first, outlined second, so
-   a nearer form hides the lines of whatever is behind it (painter's algorithm).
-   The hidden lines are not dropped but redrawn in a light ink, the way a
-   construction drawing keeps the far side of a form as a ghost line.
-   Outlines carry the construction cues artists use: end caps whose roundness
-   follows the foreshortening, drawn in full at the near end and as a half ring
-   at the far end; cross-contour rings along the limbs; centre lines on head and
-   torso that shift toward the side facing the camera.
-
-Depth comes from the landmark z, which MediaPipe scales like x. It decides the
-paint order, which end of a limb is nearer and which way a mass faces, so its
-noise shows up as an occasional swap of two forms at nearly the same depth, not
-as distorted geometry.
-"""
+# 인체 도형화 (Constructive Anatomy) 렌더러 - 3802 김민재
+# 관절 좌표만 가지고 머리/몸통은 타원체, 관절은 구, 팔다리는 원기둥으로 그린다.
+# 학습 모델 없음. 랜드마크 번호는 MediaPipe pose(33점)/hand(21점) 기준.
+# https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
 from __future__ import annotations
 
 import math
-from typing import Callable
 
 import cv2
 import numpy as np
@@ -50,16 +20,14 @@ from .base import blank_paper, scaled_points, visible
 
 INK = config.INK_COLOR
 PAPER = config.PAPER_COLOR
-# Ink for lines that a nearer form hides: a third of the way from paper to ink.
-GHOST = tuple(int(p * 0.68 + i * 0.32) for p, i in zip(PAPER, INK))
+GHOST = tuple(int(p * 0.68 + i * 0.32) for p, i in zip(PAPER, INK))  #가려진 선용 연한 잉크
 
-# --- canonical proportions, in head heights H (8-head figure) ----------------
-TORSO_H = 2.5           # shoulder centre -> hip centre
+# 비율표. 단위 H = 머리 높이 (8등신 기준)
+TORSO_H = 2.5  #어깨 중심 -> 골반 중심
 SHOULDER_SPAN_H = 1.8
-# Projected lengths above canonical x this are treated as detection errors.
-LENGTH_TOLERANCE = 1.15
+LENGTH_TOLERANCE = 1.15  #표준 길이의 이 배수를 넘으면 검출 오류로 봄
 
-# A chain is (joint indices, per-segment (length, proximal radius, distal radius)).
+# (관절 번호들), ((길이, 시작 반지름, 끝 반지름), ...)
 _ARM = ((1.5, 0.22, 0.16), (1.25, 0.16, 0.11))
 _LEG = ((2.0, 0.34, 0.21), (1.9, 0.22, 0.13))
 _BODY_CHAINS = (
@@ -68,24 +36,21 @@ _BODY_CHAINS = (
     ((L_HIP, L_KNEE, L_ANKLE), _LEG),
     ((R_HIP, R_KNEE, R_ANKLE), _LEG),
 )
-# Points that ride along when the joint they hang from is corrected.
-_BODY_FOLLOWERS = {
+_BODY_FOLLOWERS = {  #관절을 보정하면 같이 따라 움직이는 점들
     L_WRIST: (L_PINKY, L_INDEX), R_WRIST: (R_PINKY, R_INDEX),
     L_ANKLE: (L_HEEL, L_FOOT_INDEX), R_ANKLE: (R_HEEL, R_FOOT_INDEX),
 }
-_BODY_JOINTS = {
+_BODY_JOINTS = {  #관절 구 반지름
     L_SHOULDER: 0.24, R_SHOULDER: 0.24, L_ELBOW: 0.17, R_ELBOW: 0.17,
     L_WRIST: 0.12, R_WRIST: 0.12, L_HIP: 0.28, R_HIP: 0.28,
     L_KNEE: 0.23, R_KNEE: 0.23, L_ANKLE: 0.14, R_ANKLE: 0.14,
 }
 
-# Hand proportions, in palm lengths P (wrist -> middle MCP).
-PALM_WIDTH_P = 0.75     # index MCP -> pinky MCP
+# 손은 단위 P = 손바닥 길이 (손목 -> 중지 MCP)
+PALM_WIDTH_P = 0.75  #검지 MCP -> 소지 MCP
 _FINGER = ((0.42, 0.10, 0.085), (0.27, 0.085, 0.075), (0.22, 0.075, 0.065))
-# The thumb starts at its MCP: the metacarpal (1 -> 2) is inside the palm mass.
-_THUMB_CHAIN = ((2, 3, 4), ((0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))
-# Index to pinky, in order: the palm's top edge is built from these bases.
-_FINGER_CHAINS = (
+_THUMB_CHAIN = ((2, 3, 4), ((0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))  #1->2는 손바닥 안이라 뺌
+_FINGER_CHAINS = (  #검지부터 소지 순서. 손바닥 윗변을 이 순서로 만든다
     ((5, 6, 7, 8), _FINGER),
     ((9, 10, 11, 12), ((0.46, 0.10, 0.085), (0.30, 0.085, 0.075), (0.24, 0.075, 0.065))),
     ((13, 14, 15, 16), _FINGER),
@@ -94,26 +59,16 @@ _FINGER_CHAINS = (
 _HAND_CHAINS = (_THUMB_CHAIN, *_FINGER_CHAINS)
 
 
-# --- stage 1: preprocessing --------------------------------------------------
-
-class _Smoother:
-    """Exponential smoothing over strictly increasing timestamps.
-
-    A timestamp that does not advance, or jumps by more than `max_gap_ms`, resets
-    the filter. That makes a still image or a test (timestamp 0 every call) render
-    unsmoothed, and a style switch after a pause start clean instead of sliding in
-    from a stale pose.
-    """
-
-    def __init__(self, alpha_xy: float = 0.55, alpha_z: float = 0.25,
-                 max_gap_ms: int = 500) -> None:
+class _Smoother:  #프레임 간 지수 스무딩. z가 더 튀어서 z만 alpha를 낮게
+    def __init__(self, alpha_xy=0.55, alpha_z=0.25, max_gap_ms=500):
         self._alpha = np.array([alpha_xy, alpha_xy, alpha_z], dtype=np.float32)
         self._max_gap = max_gap_ms
         self._ts = 0
-        self._points: np.ndarray | None = None
+        self._points = None
 
-    def update(self, timestamp_ms: int, points: np.ndarray) -> np.ndarray:
+    def update(self, timestamp_ms, points):
         previous = self._points
+        # timestamp가 안 늘거나(정지 이미지, 테스트) 너무 벌어지면 리셋
         if (previous is None or previous.shape != points.shape
                 or timestamp_ms <= self._ts or timestamp_ms - self._ts > self._max_gap):
             self._points = points.astype(np.float32).copy()
@@ -123,14 +78,9 @@ class _Smoother:
         return self._points
 
 
-def _head_unit(points: np.ndarray, result: PerceptionResult) -> float:
-    """Head height in pixels, estimated from the torso.
-
-    Each measurement can only shrink under foreshortening, so the largest of them
-    is the closest to the truth.
-    shortcut: torso-only estimate, so a torso foreshortened in both axes shrinks
-    the limbs; upgrade to pose_world lengths once depth is smoothed enough.
-    """
+def _head_unit(points, result):  #머리 높이(px) 추정
+    # 어깨 폭, 몸통 길이 둘 다 원근으로 줄어들기만 하니까 큰 쪽이 진짜에 가깝다
+    # TODO: 몸통이 양 방향으로 다 줄어드는 자세(카메라 쪽으로 숙임)는 pose_world 길이로 바꿔야 함
     candidates = [0.0]
     if visible(result, L_SHOULDER, R_SHOULDER):
         candidates.append(
@@ -142,16 +92,9 @@ def _head_unit(points: np.ndarray, result: PerceptionResult) -> float:
     return max(candidates)
 
 
-# --- stage 3: proportion correction -----------------------------------------
-
-def _correct_proportions(points: np.ndarray, chains, unit: float,
-                         followers: dict | None = None) -> np.ndarray:
-    """Pull in every segment that projects longer than its canonical length.
-
-    Joints further down the chain move by the same offset, so the next segment
-    keeps its own direction and length, and `followers` (hand and foot points)
-    move with the joint they hang from.
-    """
+def _correct_proportions(points, chains, unit, followers=None):
+    # 표준 길이보다 긴 마디는 끝 관절을 당겨 넣는다. 짧은 건 원근이니까 그대로 둠.
+    # 당긴 만큼 그 아래 관절(과 손발 점)도 같이 이동시켜 다음 마디 모양은 유지
     points = points.copy()
     followers = followers or {}
     for chain, segments in chains:
@@ -170,44 +113,24 @@ def _correct_proportions(points: np.ndarray, chains, unit: float,
     return points
 
 
-def _foreshortening(start: np.ndarray, end: np.ndarray, canonical: float) -> float:
-    """|cos| of the angle between the limb and the image plane, in [0, 1].
-
-    0 = lying in the picture plane (end caps are flat lines), 1 = pointing at the
-    camera (end caps are full circles). Comes from the projected / canonical
-    length ratio, which is steadier than the z coordinate.
-    """
+def _foreshortening(start, end, canonical):
+    # 투영 길이 / 표준 길이로 |cos| 계산. 0 = 화면에 누움(캡이 납작), 1 = 카메라를 향함(캡이 원)
     if canonical <= 0:
         return 0.0
     ratio = min(1.0, float(np.linalg.norm(end - start)) / canonical)
     return math.sqrt(1.0 - ratio * ratio)
 
 
-# --- stage 4: solid forms ----------------------------------------------------
-
-Fill = Callable[[np.ndarray], None]
-# stroke(canvas, ink, ghost): ghost=True draws the complete outline, hidden
-# halves included, for the light pass.
-Stroke = Callable[[np.ndarray, tuple, bool], None]
-
-
 class _Scene:
-    """Painter's algorithm over simple forms, with ghost lines.
+    # 도형을 (깊이, 채우기, 외곽선)으로 모아뒀다가 먼 것부터 그린다 (painter's algorithm).
+    # 채우기는 종이색이라 가까운 도형이 뒤 선을 지움. 지워진 선은 두 번째 패스에서 연하게 다시 그림.
+    def __init__(self):
+        self._forms = []
 
-    Each form is a depth plus a fill and a stroke. paint() runs them far to near,
-    fill then outline, so a nearer form's paper-coloured fill erases the lines of
-    anything behind it. A second pass draws every outline in light ink on a clean
-    sheet, and the two are merged darkest-wins: visible lines stay ink, lines that
-    a fill erased come back as ghosts.
-    """
-
-    def __init__(self) -> None:
-        self._forms: list[tuple[float, Fill, Stroke]] = []
-
-    def add(self, depth: float, fill: Fill, stroke: Stroke) -> None:
+    def add(self, depth, fill, stroke):  #stroke(canvas, ink, ghost) - ghost면 가려진 반쪽까지 다 그림
         self._forms.append((float(depth), fill, stroke))
 
-    def paint(self, canvas: np.ndarray) -> None:
+    def paint(self, canvas):
         ordered = sorted(self._forms, key=lambda f: -f[0])
         for _, fill, stroke in ordered:
             fill(canvas)
@@ -216,35 +139,27 @@ class _Scene:
         ghost[:] = PAPER
         for _, _, stroke in ordered:
             stroke(ghost, GHOST, True)
-        np.minimum(canvas, ghost, out=canvas)
+        np.minimum(canvas, ghost, out=canvas)  #어두운 쪽이 이김 -> 보이는 선은 진하게, 가려진 선은 연하게
 
 
-def _pt(p: np.ndarray) -> tuple[int, int]:
+def _pt(p):
     return int(round(float(p[0]))), int(round(float(p[1])))
 
 
-def _axes(a: float, b: float) -> tuple[int, int]:
+def _axes(a, b):
     return max(1, int(round(a))), max(1, int(round(b)))
 
 
-def _half_ellipse(canvas, centre, along, half_along: float, half_across: float,
-                  thickness: int, ink=INK, full: bool = False) -> None:
-    """Ellipse with its first axis on `along`; only the half displaced toward
-    +along unless `full`. Every ring, cap and centre line is one of these."""
+def _half_ellipse(canvas, centre, along, half_along, half_across, thickness, ink=INK, full=False):
+    # 첫 축을 along 방향으로 둔 타원. full이 아니면 +along 쪽 절반만 (캡, 단면선, 중심선 전부 이걸로)
     angle = math.degrees(math.atan2(float(along[1]), float(along[0])))
     cv2.ellipse(canvas, _pt(centre), _axes(half_along, half_across), angle,
                 0 if full else -90, 360 if full else 90, ink, thickness, cv2.LINE_AA)
 
 
-def _add_cylinder(scene: _Scene, depth: float, start, end, r_start: float, r_end: float,
-                  squash: float, near_is_end: bool, thick: int, thin: int, *,
-                  cap_start: bool = True, cap_end: bool = True, rings: int = 0) -> None:
-    """A tapered tube with the cues that make it read as a solid.
-
-    The cap at the near end is a full ellipse; the far cap and any mid rings show
-    only the half displaced away from the near end, the half that is actually in
-    view on a solid. `squash` is the cap's minor/major ratio, i.e. foreshortening.
-    """
+def _add_cylinder(scene, depth, start, end, r_start, r_end, squash, near_is_end, thick, thin, *,
+                  cap_start=True, cap_end=True, rings=0):
+    # 끝이 가늘어지는 원기둥. 가까운 끝 캡은 온전한 타원, 먼 끝 캡과 중간 단면선은 바깥쪽 절반만
     direction = end - start
     length = float(np.linalg.norm(direction))
     if length < 1e-3:
@@ -280,18 +195,15 @@ def _add_cylinder(scene: _Scene, depth: float, start, end, r_start: float, r_end
     scene.add(depth, fill, stroke)
 
 
-def _add_sphere(scene: _Scene, depth: float, centre, r: float, thickness: int) -> None:
+def _add_sphere(scene, depth, centre, r, thickness):
     radius = max(2, int(r))
-    # The ball sits in the socket: pushed back by its radius so the cylinders
-    # meeting there paint over it, and only the part of the ball that protrudes
-    # past them keeps a full-ink outline. The rest comes back as a ghost line.
+    # 반지름만큼 뒤로 밀어서 원기둥이 구 위에 칠해지게. 튀어나온 부분만 진한 선으로 남는다
     scene.add(depth + r,
               lambda c: cv2.circle(c, _pt(centre), radius, PAPER, -1, cv2.LINE_8),
               lambda c, ink, ghost: cv2.circle(c, _pt(centre), radius, ink, thickness, cv2.LINE_AA))
 
 
-def _add_ellipse(scene: _Scene, depth: float, centre, axes: tuple[int, int], angle: float,
-                 thick: int, extra: Stroke | None = None) -> None:
+def _add_ellipse(scene, depth, centre, axes, angle, thick, extra=None):
     def stroke(c, ink, ghost):
         cv2.ellipse(c, _pt(centre), axes, angle, 0, 360, ink, thick, cv2.LINE_AA)
         if extra:
@@ -302,8 +214,7 @@ def _add_ellipse(scene: _Scene, depth: float, centre, axes: tuple[int, int], ang
               stroke)
 
 
-def _add_polygon(scene: _Scene, depth: float, pts: np.ndarray, thick: int,
-                 extra: Stroke | None = None) -> None:
+def _add_polygon(scene, depth, pts, thick, extra=None):
     poly = pts.astype(np.int32)
 
     def stroke(c, ink, ghost):
@@ -314,16 +225,10 @@ def _add_polygon(scene: _Scene, depth: float, pts: np.ndarray, thick: int,
     scene.add(depth, lambda c: cv2.fillPoly(c, [poly], PAPER, cv2.LINE_8), stroke)
 
 
-def _add_ellipsoid(scene: _Scene, depth: float, centre, up, half_w: float, half_h: float,
-                   depth_r: float, facing: float, thick: int, thin: int,
-                   ring_at: float, ring_squash: float, ring_toward: float) -> None:
-    """An ellipsoid: outline, a meridian centre line, and one latitude ring.
-
-    `facing` is sin(yaw) along `right`; it widens the silhouette by the ellipsoid's
-    depth and shifts the centre line toward the side turned to the camera.
-    `ring_at` places the ring along `up` (fraction of half_h), `ring_squash` is its
-    minor/major ratio, `ring_toward` the sign of `up` its visible half faces.
-    """
+def _add_ellipsoid(scene, depth, centre, up, half_w, half_h, depth_r, facing, thick, thin,
+                   ring_at, ring_squash, ring_toward):
+    # 타원체 = 윤곽 + 중심선(카메라 향한 쪽으로 쏠림) + 가로 단면선 하나
+    # facing = right 방향 sin(yaw). 돌아선 만큼 폭이 depth_r 쪽으로 바뀌고 중심선이 옆으로 간다
     right = np.array([-up[1], up[0]], dtype=np.float32)
     facing = max(-1.0, min(1.0, facing))
     proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth_r ** 2 * facing ** 2)
@@ -339,8 +244,7 @@ def _add_ellipsoid(scene: _Scene, depth: float, centre, up, half_w: float, half_
     _add_ellipse(scene, depth, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
 
 
-def _base_edge(points, chain, r: float, order: np.ndarray) -> list[np.ndarray]:
-    """The two corners of a chain's first cylinder base, sorted along `order`."""
+def _base_edge(points, chain, r, order):  #마디 첫 원기둥의 밑동 양 끝점. order 방향으로 정렬
     base = points[chain[0]]
     axis = points[chain[1]] - base
     axis = axis / (np.linalg.norm(axis) or 1.0)
@@ -348,38 +252,31 @@ def _base_edge(points, chain, r: float, order: np.ndarray) -> list[np.ndarray]:
     return sorted((base + normal, base - normal), key=lambda p: float(np.dot(p, order)))
 
 
-def _palm_outline(points: np.ndarray, P: float) -> np.ndarray:
-    """The palm polygon, wrist corner -> (thumb base) -> finger bases -> wrist corner.
-
-    The outline runs through the bases of the digits: each finger's proximal
-    cylinder starts on a segment across its MCP, and those segments, joined by
-    short webs, are the palm's upper edge, so the palm's corners and the fingers'
-    base corners are the same points. The thumb's base joins the index-side edge
-    where the thenar bulges out - unless the thumb is folded across the palm, when
-    its MCP lies inside the outline and including it would make the polygon cross
-    itself; then the thumb just lies on top of the palm.
-    """
+def _palm_outline(points, P):
+    # 손바닥 다각형: 손목 모서리 -> (엄지 밑동) -> 손가락 밑동들 -> 손목 모서리
+    # 윗변을 손가락 밑동 선분으로 만들어서 손바닥 꼭짓점 = 손가락 밑동 꼭짓점이 되게 함
     across = points[17] - points[5]
     across = across / (np.linalg.norm(across) or 1.0)
-    top: list[np.ndarray] = []
+    top = []
     for chain, segments in _FINGER_CHAINS:
         top += _base_edge(points, chain, segments[0][1] * P, across)
     wrist_index = points[0] - across * P * 0.28
     wrist_pinky = points[0] + across * P * 0.28
 
-    edge = top[0] - wrist_index
-    def side(p) -> float:  # which side of the index-side edge p is on
+    edge = top[0] - wrist_index  #검지 쪽 가장자리
+    def side(p):  #edge 기준 어느 쪽인지 (외적 부호)
         d = p - wrist_index
         return float(edge[0] * d[1] - edge[1] * d[0])
     centre = points[[0, 5, 9, 13, 17]].mean(axis=0)
+    # 엄지가 손바닥 안으로 접히면 MCP가 안쪽에 들어와서 다각형이 꼬임 -> 그땐 윤곽에서 빼고 위에 얹기만
     thumb_out = side(points[_THUMB_CHAIN[0][0]]) * side(centre) < 0
     thumb = (_base_edge(points, _THUMB_CHAIN[0], _THUMB_CHAIN[1][0][1] * P, edge)
              if thumb_out else [])
     return np.array([wrist_index, *thumb, *top, wrist_pinky])
 
 
-def _add_chain(scene: _Scene, points, depth, chain, segments, unit: float, thick: int,
-               thin: int, *, rings: int, tips_only: bool, ok=lambda a, b: True) -> None:
+def _add_chain(scene, points, depth, chain, segments, unit, thick, thin, *,
+               rings, tips_only, ok=lambda a, b: True):
     pairs = list(zip(chain, chain[1:]))
     for i, ((a, b), (length, r0, r1)) in enumerate(zip(pairs, segments)):
         if not ok(a, b):
@@ -389,24 +286,19 @@ def _add_chain(scene: _Scene, points, depth, chain, segments, unit: float, thick
             scene, (depth[a] + depth[b]) / 2, points[a], points[b], r0 * unit, r1 * unit,
             squash=_foreshortening(points[a], points[b], length * unit),
             near_is_end=bool(depth[b] < depth[a]), thick=thick, thin=thin,
-            # In tips_only mode the base of the chain still gets its cap: that
-            # line is the finger's root on the palm, shared with the palm outline.
+            # tips_only(손)여도 첫 마디 밑동 캡은 그림 - 손바닥 윗변과 겹치는 그 선
             cap_start=i == 0 or not tips_only, cap_end=last or not tips_only, rings=rings,
         )
 
 
-# --- the renderer -------------------------------------------------------------
-
 class ConstructiveRenderer:
     name = "Constructive Anatomy"
 
-    def __init__(self) -> None:
+    def __init__(self):
         self._pose_filter = _Smoother()
         self._hand_filter = _Smoother()
 
-    def render(
-        self, result: PerceptionResult, target: Target, size: tuple[int, int]
-    ) -> np.ndarray:
+    def render(self, result: PerceptionResult, target: Target, size: tuple[int, int]) -> np.ndarray:
         canvas = blank_paper(size)
         scene = _Scene()
         if target is Target.HAND:
@@ -416,14 +308,12 @@ class ConstructiveRenderer:
         scene.paint(canvas)
         return canvas
 
-    # -- full body ---------------------------------------------------------
-
-    def _build_body(self, scene: _Scene, result: PerceptionResult, size: tuple[int, int]) -> None:
+    def _build_body(self, scene, result, size):
         if result.pose is None:
             return
         pose = self._pose_filter.update(result.timestamp_ms, result.pose)
         points = scaled_points(pose, size)
-        depth = pose[:, 2] * size[0]  # z is scaled like x, so width converts it to pixels
+        depth = pose[:, 2] * size[0]  #z는 x와 같은 스케일이라 width 곱하면 px
         H = _head_unit(points, result)
         if H < 3:
             return
@@ -447,16 +337,13 @@ class ConstructiveRenderer:
             _add_chain(scene, points, depth, chain, segments, H, thick, thin,
                        rings=1, tips_only=False, ok=seen)
 
-        # Hands as mittens, feet as wedges: enough to show where the limb ends and
-        # which way the extremity points, without competing with hand mode.
+        # 손은 미튼 타원, 발은 쐐기. 손 모드랑 겹치지 않을 만큼만
         for wrist, pinky, index in ((L_WRIST, L_PINKY, L_INDEX), (R_WRIST, R_PINKY, R_INDEX)):
             if seen(wrist, pinky, index):
                 tip = (points[pinky] + points[index]) / 2
                 along = tip - points[wrist]
                 length = float(np.linalg.norm(along))
-                # A hand pointed at the camera is already told by the full wrist
-                # cap; a mitten on top of it just stacks a third circle there.
-                if length > H * 0.25:
+                if length > H * 0.25:  #카메라를 향한 손은 손목 캡이 이미 원이라 미튼까지 그리면 원 세 겹
                     _add_ellipse(scene, depth[wrist], (points[wrist] + tip) / 2,
                                  _axes(length / 2, H * 0.2),
                                  math.degrees(math.atan2(float(along[1]), float(along[0]))), thick)
@@ -469,29 +356,26 @@ class ConstructiveRenderer:
             if seen(idx):
                 _add_sphere(scene, depth[idx], points[idx], r * H, thick)
 
-    def _torso(self, scene, points, depth, shoulders, hips, H, thick, thin) -> None:
+    def _torso(self, scene, points, depth, shoulders, hips, H, thick, thin):
         spine = hips - shoulders
         length = float(np.linalg.norm(spine)) or 1.0
         up = -spine / length
         right = np.array([-up[1], up[0]], dtype=np.float32)
 
-        def facing(a: int, b: int) -> float:
-            # The front turns toward the nearer of the two joints. sin(yaw) is
-            # positive toward b, then re-signed onto the torso's `right` axis.
+        def facing(a, b):  #앞면은 더 가까운 관절 쪽으로 돈다. sin(yaw)를 right 축 부호로 맞춤
             ab = points[b] - points[a]
             d = math.hypot(float(np.linalg.norm(ab)), float(depth[b] - depth[a])) or 1.0
             toward_b = float(depth[a] - depth[b]) / d
             return toward_b * (1.0 if float(np.dot(ab, right)) >= 0 else -1.0)
 
-        # Pitch: leaning toward the camera tilts the horizontal cross-sections open.
+        # 앞뒤로 숙이면 가로 단면이 벌어져 보임
         z_shoulders = float(depth[L_SHOULDER] + depth[R_SHOULDER]) / 2
         z_hips = float(depth[L_HIP] + depth[R_HIP]) / 2
         dz = z_hips - z_shoulders
         pitch = abs(dz) / math.hypot(length, dz)
-        ring_toward = -1.0 if dz > 0 else 1.0  # visible half faces away from the near end
+        ring_toward = -1.0 if dz > 0 else 1.0  #보이는 반쪽은 가까운 끝 반대편
 
-        # Ribcage and pelvis as separate masses; the waist between them is where
-        # the body twists, which is the point of drawing them apart.
+        # 흉곽과 골반을 따로. 허리에서 비틀리는 게 보여야 하니까
         _add_ellipsoid(scene, z_shoulders, shoulders + spine * 0.34, up, H * 0.72, H * 0.85,
                        H * 0.55, facing(L_SHOULDER, R_SHOULDER), thick, thin,
                        ring_at=-0.6, ring_squash=pitch, ring_toward=ring_toward)
@@ -499,7 +383,7 @@ class ConstructiveRenderer:
                        H * 0.50, facing(L_HIP, R_HIP), thick, thin,
                        ring_at=0.0, ring_squash=pitch, ring_toward=ring_toward)
 
-    def _head(self, scene, points, depth, result, shoulders, up, H, thick, thin) -> None:
+    def _head(self, scene, points, depth, result, shoulders, up, H, thick, thin):
         if visible(result, L_EAR, R_EAR):
             centre = (points[L_EAR] + points[R_EAR]) / 2
             z = float(depth[L_EAR] + depth[R_EAR]) / 2
@@ -511,7 +395,7 @@ class ConstructiveRenderer:
         right = np.array([-up[1], up[0]], dtype=np.float32)
         half_w, half_h, depth_r = H * 0.37, H * 0.5, H * 0.45
 
-        # The nose fixes the facial centre line directly, no yaw estimate needed.
+        # 얼굴 중심선은 코 위치로 바로 정함 (yaw 추정 필요 없음)
         offset = float(np.dot(points[NOSE] - centre, right)) if visible(result, NOSE) else 0.0
         facing = max(-1.0, min(1.0, offset / depth_r))
         proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth_r ** 2 * facing ** 2)
@@ -529,26 +413,20 @@ class ConstructiveRenderer:
 
         _add_ellipse(scene, z, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
 
-        # Neck: a short cylinder from under the skull to the shoulder line. A head
-        # further than 1.5 H from the shoulders is a partial or mis-detected pose,
-        # and a long neck would only advertise it.
+        # 목. 머리가 어깨에서 1.5H 넘게 떨어져 있으면 검출이 이상한 거라 안 그림
         if np.linalg.norm(centre - shoulders) <= H * 1.5:
             z_shoulders = float(depth[L_SHOULDER] + depth[R_SHOULDER]) / 2
-            # Just behind both, so the skull and the ribcage cover its ends.
-            _add_cylinder(scene, max(z, z_shoulders) + 1.0, centre - up * half_h * 0.9,
+            _add_cylinder(scene, max(z, z_shoulders) + 1.0, centre - up * half_h * 0.9,  #머리/흉곽 뒤에
                           shoulders, H * 0.2, H * 0.22, squash=0.0, near_is_end=False,
                           thick=thick, thin=thin, cap_start=False, cap_end=False)
 
-    # -- hand ----------------------------------------------------------------
-
-    def _build_hand(self, scene: _Scene, result: PerceptionResult, size: tuple[int, int]) -> None:
+    def _build_hand(self, scene, result, size):
         if result.hand is None:
             return
         hand = self._hand_filter.update(result.timestamp_ms, result.hand)
         points = scaled_points(hand, size, fit=0.12)
         depth = hand[:, 2]
-        # Palm length, measured after the fit-to-canvas zoom. Width is the fallback
-        # for a palm seen edge-on.
+        # 손바닥 길이 (fit 확대 후 기준). 옆에서 본 손은 폭으로 대신
         P = max(float(np.linalg.norm(points[0] - points[9])),
                 float(np.linalg.norm(points[5] - points[17])) / PALM_WIDTH_P)
         if P < 3:
@@ -558,8 +436,7 @@ class ConstructiveRenderer:
         thin = max(1, thick // 2)
 
         palm = _palm_outline(points, P)
-        # Mid-palm cross line between the two side edges (top[0] is palm[-9]).
-        mid_a, mid_b = (palm[0] + palm[-9]) / 2, (palm[-1] + palm[-2]) / 2
+        mid_a, mid_b = (palm[0] + palm[-9]) / 2, (palm[-1] + palm[-2]) / 2  #palm[-9]가 검지 밑동 바깥점
         _add_polygon(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, thick,
                      extra=lambda c, ink, ghost: cv2.line(c, _pt(mid_a), _pt(mid_b), ink, thin,
                                                           cv2.LINE_AA))
@@ -567,6 +444,5 @@ class ConstructiveRenderer:
         for chain, segments in _HAND_CHAINS:
             _add_chain(scene, points, depth, chain, segments, P, thick, thin,
                        rings=0, tips_only=True)
-            # Spheres at every finger joint, the reference-drawing convention.
-            for idx, (_, r0, _) in zip(chain[1:-1], segments[1:]):
+            for idx, (_, r0, _) in zip(chain[1:-1], segments[1:]):  #마디마다 관절 구
                 _add_sphere(scene, depth[idx], points[idx], r0 * P * 1.05, thin)
