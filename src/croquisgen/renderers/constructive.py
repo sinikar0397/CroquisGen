@@ -308,7 +308,9 @@ class ConstructiveRenderer:
                 tip = (points[pinky] + points[index]) / 2
                 along = tip - points[wrist]
                 length = float(np.linalg.norm(along))
-                if length > 1:
+                # A hand pointed at the camera is already told by the full wrist
+                # cap; a mitten on top of it just stacks a third circle there.
+                if length > H * 0.25:
                     _half_ellipse(canvas, (points[wrist] + tip) / 2, along / length,
                                   max(length / 2, H * 0.2), H * 0.2, thick, full=True)
         for ankle, heel, toe in ((L_ANKLE, L_HEEL, L_FOOT_INDEX), (R_ANKLE, R_HEEL, R_FOOT_INDEX)):
