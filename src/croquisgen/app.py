@@ -21,7 +21,7 @@ from .state import StateMachine
 from .types import INDEX_TIP, Style
 from .ui.overlay import draw_camera_inset, draw_status_bar, draw_toast
 from .ui.radial_menu import draw_hold_progress, draw_menu
-
+     
 WINDOW = "CroquisGen"
 
 
