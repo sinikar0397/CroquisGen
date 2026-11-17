@@ -1,0 +1,179 @@
+"""
+CroquisGen S1+S2 runner: image -> RTMPose 2D keypoints -> 3D skeleton -> visualisation.
+
+    python -m croquisgen.run --image photo.jpg                      # RTMPose Halpe-26 + RTMW3D depth
+    python -m croquisgen.run --image photo.jpg --s2 geometric       # no 3D network (rough)
+    python -m croquisgen.run --images photos/ --out out/            # batch a folder
+    python -m croquisgen.run --demo                                 # synthetic pose, no models
+    python -m croquisgen.run --image sit.jpg --contacts lheel,rheel,pelvis   # seated: override contacts
+
+Stages: S1 RTMPose 2D -> S2 3D skeleton + spine curve -> S3 static load (T0).
+Outputs per image in --out:  <stem>.npz (PoseFrame)  <stem>_3d.html (interactive)  <stem>_views.png
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import time
+from pathlib import Path
+import cv2
+import numpy as np
+
+from .poseframe import PoseFrame
+from .s2_lift import Lifter3D, default_K, exif_focal_35mm, fit_skeleton, init_from_depth, project
+from .skeleton import IDX, J
+from .s3_load import static_load
+from . import viz
+
+IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+class Pipeline:
+    """Holds the loaded models so repeated calls (batch now, webcam later) skip re-loading."""
+
+    def __init__(self, s1="halpe26", mode="balanced", s2="rtmw3d", height=1.70, device="auto",
+                 z_sign="auto", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
+                 search=True, physical=True, label_swaps=True, workers=None, occlusion=True):
+        from .s1_keypoints import RTMPose2D
+        t = time.perf_counter()
+        self.s1 = RTMPose2D(s1, mode=mode, device=device)
+        self.s2 = Lifter3D(s2, height=height, z_sign=z_sign, device=device, dynamic=dynamic, search=search,
+                           physical=physical, mass=mass, label_swaps=label_swaps, workers=workers,
+                           occlusion=occlusion)
+        self.s3 = dict(body_mass=mass, contacts=contacts, sagittal=sagittal) if s3 else None
+        print(f"[init] models ready in {time.perf_counter() - t:.1f}s  (S1 device: {self.s1.device})")
+
+    def __call__(self, img_bgr, K=None):
+        r = self.s1(img_bgr)
+        f = PoseFrame(img_hw=img_bgr.shape[:2], kpts2d=r["kpts"], conf=r["conf"], bbox=r["bbox"],
+                      s1_layout=r["layout"], raw_kpts2d=r["raw_kpts"], raw_conf=r["raw_conf"])
+        t = time.perf_counter()
+        self.s2(f, img_bgr, K=K)
+        f.s2_info.update(s1_det_ms=r["timings"]["det_ms"], s1_pose_ms=r["timings"]["pose_ms"],
+                         s2_total_ms=1e3 * (time.perf_counter() - t), n_people=r["n_people"])
+        if self.s3 is not None:
+            t = time.perf_counter()
+            kw = dict(self.s3)
+            if kw.get("contacts") is None and f.s2_info.get("contacts"):
+                kw["contacts"] = f.s2_info["contacts"]       # same contacts the integrated fit used
+            static_load(f, **kw)
+            f.s3_info["s3_ms"] = 1e3 * (time.perf_counter() - t)
+        return f
+
+
+def write_outputs(frame, img, out_dir, stem, title):
+    os.makedirs(out_dir, exist_ok=True)
+    frame.save(os.path.join(out_dir, f"{stem}.npz"))
+    viz.make_html(frame, img, os.path.join(out_dir, f"{stem}_3d.html"), title=title)
+    viz.make_png(frame, img, os.path.join(out_dir, f"{stem}_views.png"))
+
+
+def run_demo(out_dir, height, s3_kw=None):
+    """Synthetic lunge rendered as a stick-figure 'photo'; simulated depth cue. Tests S2 + viz only."""
+    from .synthetic import lunge_pose
+    hw = (960, 1280)
+    K = default_K(hw)
+    X = lunge_pose(height=height)
+    rng = np.random.default_rng(0)
+    uv = project(X, K) + rng.normal(0, 2, (J, 2))
+    conf = np.full(J, 0.9, np.float32)
+    img = np.full((*hw, 3), 235, np.uint8)
+    f = PoseFrame(img_hw=hw, kpts2d=uv.astype(np.float32), conf=conf,
+                  bbox=np.r_[uv.min(0) - 40, uv.max(0) + 40], s1_layout="synthetic")
+    z = (X[:, 2] - X[IDX["pelvis"], 2]) * 0.85 + rng.normal(0, 0.03, J)
+    Xh, v, info = fit_skeleton(uv, conf, K, height, X0=init_from_depth(uv, conf, K, height, z, 1),
+                               z_rel=z, z_conf=conf)
+    f.joints3d, f.valid3d, f.camera_K, f.s2_info, f.s2_backend = Xh, v, K, info, "demo (simulated depth)"
+    f.body_height_m = height
+    if s3_kw is not None:
+        static_load(f, **s3_kw)
+        print(summary_s3(f))
+    write_outputs(f, img, out_dir, "demo", "CroquisGen S1+S2 · synthetic demo")
+    print(json.dumps({k: v for k, v in info.items() if k != "hinge"}, indent=1, default=float))
+
+
+def summary_s3(f):
+    i, ms = f.s3_info, f.muscle_stretch
+    top = sorted(i["effort_fraction_of_capacity"].items(), key=lambda kv: -kv[1])[:4]
+    bal = ("airborne" if i["com_offset_m"] is None else "balanced" if i["balanced"]
+           else "COM %.2f m outside support" % i["com_offset_m"])
+    return ("  S3: contacts %s%s | %s | top effort %s | spine bend %+.0f° twist %+.0f° | compressed side %s"
+            % (",".join(f.contacts) or "-",
+               " (+%s for balance)" % ",".join(i["contacts_added_for_balance"]) if i["contacts_added_for_balance"] else "",
+               bal, ", ".join("%s %.2f" % kv for kv in top),
+               ms["spine_lateral_bend"], ms["spine_twist"], ms["compressed_torso_side"].upper()))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--image"); ap.add_argument("--images", help="folder of images")
+    ap.add_argument("--out", default="out")
+    ap.add_argument("--s1", default="halpe26", choices=["halpe26", "wholebody", "coco17"])
+    ap.add_argument("--mode", default="balanced", choices=["lightweight", "balanced", "performance"])
+    ap.add_argument("--s2", default="rtmw3d", choices=["rtmw3d", "geometric"])
+    ap.add_argument("--height", type=float, default=1.70, help="subject height prior, metres")
+    ap.add_argument("--fov", type=float, default=55.0, help="horizontal FOV if no EXIF focal length")
+    ap.add_argument("--z-sign", default="auto", choices=["auto", "+", "-"])
+    ap.add_argument("--device", default="auto", help="auto | cpu | mps (CoreML) | cuda")
+    ap.add_argument("--mass", type=float, default=None, help="body mass kg (default: BMI 22 from height)")
+    ap.add_argument("--contacts", default=None,
+                    help="comma list overriding auto contacts, e.g. lheel,rbigtoe,pelvis (pelvis = seated)")
+    ap.add_argument("--sagittal", type=float, default=0.0,
+                    help="assumed front/back spine curvature (fraction of trunk length, + = flexed)")
+    ap.add_argument("--no-s3", action="store_true")
+    ap.add_argument("--no-search", action="store_true",
+                    help="skip the plausibility search over depth flips (faster, less robust)")
+    ap.add_argument("--no-physical", action="store_true",
+                    help="skip the integrated S2+S3 physical fit (muscle relaxation, effort, floor)")
+    ap.add_argument("--no-label-swaps", action="store_true",
+                    help="trust the detector's left/right labels even where limbs overlap")
+    ap.add_argument("--no-occlusion", action="store_true",
+                    help="ignore body-part contours (limb-in-front/behind-torso order from image edges)")
+    ap.add_argument("--workers", type=int, default=None, help="parallel fit processes (default: #cores, max 8)")
+    ap.add_argument("--dynamic", action="store_true",
+                    help="running/jumping/falling: disable the static-balance prior in the 3D fit")
+    ap.add_argument("--demo", action="store_true")
+    a = ap.parse_args()
+
+    contacts = a.contacts.split(",") if a.contacts else None
+    s3_kw = None if a.no_s3 else dict(body_mass=a.mass, contacts=contacts, sagittal=a.sagittal)
+    if a.demo:
+        return run_demo(a.out, a.height, s3_kw)
+    paths = [a.image] if a.image else sorted(str(p) for p in Path(a.images).iterdir()
+                                             if p.suffix.lower() in IMG_EXT)
+    pipe = Pipeline(a.s1, a.mode, a.s2, a.height, a.device, a.z_sign, s3=not a.no_s3,
+                    mass=a.mass, contacts=contacts, sagittal=a.sagittal, dynamic=a.dynamic,
+                    search=not a.no_search, physical=not a.no_physical,
+                    label_swaps=not a.no_label_swaps, workers=a.workers, occlusion=not a.no_occlusion)
+    for p in paths:
+        img = cv2.imread(p)
+        if img is None:
+            print(f"skip {p}: unreadable"); continue
+        K = default_K(img.shape[:2], fov_deg=a.fov, focal_35mm=exif_focal_35mm(p))
+        f = pipe(img, K=K)
+        stem = Path(p).stem
+        write_outputs(f, img, a.out, stem, f"CroquisGen S1+S2 · {Path(p).name}")
+        i = f.s2_info
+        print(f"{Path(p).name}: people {i['n_people']} | S1 det {i['s1_det_ms']:.0f} ms + pose "
+              f"{i['s1_pose_ms']:.0f} ms | S2 {i['s2_total_ms']:.0f} ms | reproj {i['reproj_px_median']:.1f}px "
+              f"| bones {i['bone_err_pct_median']:.1f}% | dist {i['subject_distance_m']:.2f} m"
+              + (f" | z-sign {i['z_sign']:+d} (x{i.get('z_sign_cost_ratio', 0):.2f}, init {i.get('init')})" if "z_sign" in i else "")
+              + f" | fitted height {i['fitted_height_m']:.2f} m")
+        if "physics" in i:
+            ph = i["physics"]
+            print("  S2+S3 fit: labels '%s' | depth flips: %s | energy margin x%.2f | passive %.1f effort %.2f "
+                  "balance %.2f floor %.2f | pitch %+.1f° | least relaxed: %s"
+                  % (i.get("label_hypothesis"), ", ".join(i.get("flips", {})) or "none", i.get("energy_margin", 0),
+                     ph["passive"], ph["effort"], ph.get("balance", 0), ph.get("floor", 0), ph["pitch_deg"],
+                     ", ".join("%s %+.1f" % kv for kv in list(ph["worst_joints"].items())[:3])))
+            if i.get("occlusion"):
+                print("  occlusion from contours: " + ", ".join(f"{k} {v} torso" for k, v in i["occlusion"].items()))
+            if i.get("energy_margin", 9) < 1.05:
+                print("  ! two readings are almost equally good: check the side view")
+        if f.s3_info:
+            print(summary_s3(f))
+    print(f"outputs in {os.path.abspath(a.out)}")
+
+
+if __name__ == "__main__":
+    main()
