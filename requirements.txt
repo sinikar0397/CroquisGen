@@ -4,6 +4,13 @@
 mediapipe>=1.2.0
 opencv-python>=4.9
 numpy>=1.26
+scipy>=1.11
+
+onnxruntime>=1.17        # includes CoreMLExecutionProvider on macOS arm64
+rtmlib>=0.0.16           # RTMPose / RTMW3D without mmcv
+plotly>=5.20             # interactive 3D html (offline, js embedded)
+matplotlib>=3.8
+pillow>=10               # EXIF focal length
 
 # tests
 pytest>=8.0
