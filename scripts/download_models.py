@@ -1,6 +1,6 @@
 """Fetch the MediaPipe task bundles into models/.
 
-The bundles are ~31 MB together and are not in the repository.
+The bundles are ~23 MB together and are not in the repository.
 """
 from __future__ import annotations
 
@@ -8,13 +8,17 @@ import sys
 import urllib.request
 from pathlib import Path
 
-BASE_URL = "https://storage.googleapis.com/mediapipe-models"
-MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from core.config import MODEL_DIR  # noqa: E402  (path set above)
+
+BASE_URL = "https://storage.googleapis.com/mediapipe-models"
+
+# hand_landmarker is deliberately absent: GestureRecognizer returns the same 21
+# landmarks plus a pre-trained label at the same cost, so nothing ever loaded it.
 MODELS = {
     "pose_landmarker_full.task": "pose_landmarker/pose_landmarker_full/float16/latest",
     "pose_landmarker_lite.task": "pose_landmarker/pose_landmarker_lite/float16/latest",
-    "hand_landmarker.task": "hand_landmarker/hand_landmarker/float16/latest",
     "gesture_recognizer.task": "gesture_recognizer/gesture_recognizer/float16/latest",
 }
 
