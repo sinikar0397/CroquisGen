@@ -1,7 +1,7 @@
 """Tunables in one place.
 
 Numbers that affect the frame budget are commented with what they cost. Measured
-on an M-series CPU at 1280x720 with scripts/bench_perception.py.
+on an M-series CPU at 1280x720 with tools/bench_perception.py.
 """
 from __future__ import annotations
 
@@ -11,13 +11,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_DIR = PROJECT_ROOT / "models"
 CAPTURE_DIR = PROJECT_ROOT / "captures"
 
+# Which landmark source perception.get_backend() builds. This is the line that
+# changes when the RTMPose stack in gesture_croquis/ grows a real-time path;
+# everything downstream sees the same PerceptionResult either way.
+POSE_BACKEND = "mediapipe"
+
 # "full" costs ~25 ms/frame, "lite" ~15 ms. Drop to lite if the renderers push the
 # loop under 30 fps - lite loses accuracy mostly on occluded limbs.
-
-# wil be changed as soon as 준현이랑 민재가 모델 만들 때
 POSE_MODEL = MODEL_DIR / "pose_landmarker_full.task"
+# GestureRecognizer is a superset of HandLandmarker - same 21 landmarks plus a
+# pre-trained label at the same cost - so hand_landmarker.task is not needed.
 GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
-HAND_MODEL = MODEL_DIR / "hand_landmarker.task"
 
 CAMERA_INDEX = 0
 # Capture resolution barely affects inference time - MediaPipe resizes to the

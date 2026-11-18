@@ -1,4 +1,6 @@
-"""MediaPipe wrappers.
+"""MediaPipe Tasks backend: pose every frame, hands on a slower cadence.
+
+Selected via perception.get_backend("mediapipe").
 
 Two things here are not obvious and matter a lot:
 
@@ -11,22 +13,20 @@ Two things here are not obvious and matter a lot:
 """
 from __future__ import annotations
 
-import time
-
 import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-from . import config
-from .types import PerceptionResult
+from core import config
+from core.types import PerceptionResult
 
 
 def _landmarks_to_array(landmarks) -> np.ndarray:
     return np.array([[p.x, p.y, p.z] for p in landmarks], dtype=np.float32)
 
 
-class Perception:
+class MediaPipePerception:
     """Runs pose every frame and hands on a slower cadence."""
 
     def __init__(
@@ -127,25 +127,8 @@ class Perception:
         self._pose.close()
         self._gesture.close()
 
-    def __enter__(self) -> "Perception":
+    def __enter__(self) -> "MediaPipePerception":
         return self
 
     def __exit__(self, *exc) -> None:
         self.close()
-
-
-class FrameClock:
-    """Exponentially smoothed frame rate, for the status bar."""
-
-    def __init__(self, smoothing: float = 0.9) -> None:
-        self._smoothing = smoothing
-        self._last = time.perf_counter()
-        self.fps = 0.0
-
-    def tick(self) -> float:
-        now = time.perf_counter()
-        dt = max(now - self._last, 1e-6)
-        self._last = now
-        instant = 1.0 / dt
-        self.fps = instant if self.fps == 0.0 else self._smoothing * self.fps + (1 - self._smoothing) * instant
-        return self.fps
