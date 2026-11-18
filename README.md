@@ -73,7 +73,3 @@ src/
 scripts/                 모델 다운로드, 정지 이미지 렌더링
 tests/                   카메라·모델 없이 도는 테스트
 ```
-
-렌더러는 `PerceptionResult`만 보고 이미지를 돌려주는 순수 함수다. 카메라도 화면도
-앱 상태도 건드리지 않으므로, 스타일을 추가할 때 고칠 곳은 `core/types.py`의 `Style`,
-`render/registry.py`, `app/gestures.py`의 `style_for_direction()` 세 곳이다.
