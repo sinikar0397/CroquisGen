@@ -40,6 +40,10 @@ class GestureEvent:
 class SnapDetector:
     """Finger snap, by heuristic.
 
+    수정 예정임
+    일단은 placeholder
+    snap이 아닌 다른 gesture로 변경 가능함
+
     This is the weak point of the gesture set and is worth validating early. A snap
     takes a few tens of milliseconds, so at 30 fps it spans 1-2 frames and motion
     blur degrades exactly the landmarks needed to see it. The heuristic below looks
@@ -188,7 +192,11 @@ class GestureInterpreter:
 
 
 def style_for_direction(dx: float, dy: float) -> Style:
-    """Which sector a fingertip offset points at.
+    """
+    hand crocquis 관련해서 수정되면 여기 바궈야 함
+    일단 상단 & 하단부 구분만 해놓음
+    사실 args(동경)을 dx, dy에서 atan2로 뽑으면 쉽게 해결 가능
+    Which sector a fingertip offset points at.
 
     Two styles split the circle into upper and lower halves, matching the mockup
     where Gesture Croquis sits above Constructive Anatomy. Adding a third style

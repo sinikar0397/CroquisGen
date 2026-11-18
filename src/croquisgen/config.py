@@ -13,6 +13,8 @@ CAPTURE_DIR = PROJECT_ROOT / "captures"
 
 # "full" costs ~25 ms/frame, "lite" ~15 ms. Drop to lite if the renderers push the
 # loop under 30 fps - lite loses accuracy mostly on occluded limbs.
+
+# wil be changed as soon as 준현이랑 민재가 모델 만들 때
 POSE_MODEL = MODEL_DIR / "pose_landmarker_full.task"
 GESTURE_MODEL = MODEL_DIR / "gesture_recognizer.task"
 HAND_MODEL = MODEL_DIR / "hand_landmarker.task"

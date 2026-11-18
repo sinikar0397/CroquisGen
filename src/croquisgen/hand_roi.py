@@ -1,4 +1,7 @@
-"""Hand ROI from the body skeleton.
+"""
+not used currently
+
+Hand ROI from the body skeleton.
 
 Task 2 in the plan ("전신 사진에서 손 ROI 지정하기") originally assumed a separate
 YOLO hand detector. It does not need one: the forearm direction already says where
