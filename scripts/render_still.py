@@ -13,14 +13,15 @@ import argparse
 import sys
 from pathlib import Path
 
-import _bootstrap  # noqa: F401
-import cv2
-import numpy as np
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from croquisgen import config
-from croquisgen.perception import Perception
-from croquisgen.renderers import get_renderer, renderer_name
-from croquisgen.types import Style, Target
+import cv2  # noqa: E402  (path set above)
+import numpy as np  # noqa: E402
+
+from core import config  # noqa: E402
+from core.types import Style, Target  # noqa: E402
+from perception import get_backend  # noqa: E402
+from render.registry import get_renderer, renderer_name  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -41,8 +42,8 @@ def main(argv: list[str] | None = None) -> int:
     target = Target(args.target)
     styles = [Style(args.style)] if args.style else list(Style)
 
-    with Perception() as perception:
-        # Perception runs in VIDEO mode, which tracks across calls. On a still
+    with get_backend() as perception:
+        # The backend runs in VIDEO mode, which tracks across calls. On a still
         # image the first call is a cold detect, so run it a few times and keep the
         # last result to match what the app sees mid-stream.
         for _ in range(3):
