@@ -4,8 +4,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from ..renderers import renderer_name
-from ..types import AppState, Target
+from render.registry import renderer_name
+from core.types import AppState, Target
 
 _BAR_HEIGHT = 34
 _BAR_COLOR = (28, 24, 22)

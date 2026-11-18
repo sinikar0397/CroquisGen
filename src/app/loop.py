@@ -1,6 +1,6 @@
 """Main loop: camera -> perception -> gesture events -> render -> display.
 
-Run with `python -m croquisgen.app` from src/, or `python scripts/run.py`.
+Run with `python main.py` from the repository root.
 
 Keyboard shortcuts mirror every gesture. They are not a convenience - debugging a
 renderer while holding poses in front of a camera is impractical, and the gesture
@@ -9,20 +9,40 @@ layer needs to be bypassable when the thing under test is the drawing code.
 from __future__ import annotations
 
 import argparse
+import time
 
 import cv2
 
-from . import config
-from .capture import Camera
+from core import config
+from core.landmarks import INDEX_TIP
+from core.types import Style
+from perception import get_backend
+from render.registry import get_renderer
+
+from .camera import Camera
 from .gestures import GestureInterpreter
-from .perception import FrameClock, Perception
-from .renderers import get_renderer
 from .state import StateMachine
-from .types import INDEX_TIP, Style
 from .ui.overlay import draw_camera_inset, draw_status_bar, draw_toast
 from .ui.radial_menu import draw_hold_progress, draw_menu
-     
+
 WINDOW = "CroquisGen"
+
+
+class FrameClock:
+    """Exponentially smoothed frame rate, for the status bar."""
+
+    def __init__(self, smoothing: float = 0.9) -> None:
+        self._smoothing = smoothing
+        self._last = time.perf_counter()
+        self.fps = 0.0
+
+    def tick(self) -> float:
+        now = time.perf_counter()
+        dt = max(now - self._last, 1e-6)
+        self._last = now
+        instant = 1.0 / dt
+        self.fps = instant if self.fps == 0.0 else self._smoothing * self.fps + (1 - self._smoothing) * instant
+        return self.fps
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -44,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
     interpreter = GestureInterpreter(enable_snap=not args.no_snap)
     clock = FrameClock()
 
-    with Camera(index=args.camera) as camera, Perception(pose_model=pose_model) as perception:
+    with Camera(index=args.camera) as camera, get_backend(pose_model=pose_model) as perception:
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
         width, height = camera.size
 
@@ -106,7 +126,3 @@ def _handle_key(key: int, machine: StateMachine, croquis) -> None:
         machine.set_style(Style.CONSTRUCTIVE)
     elif key == ord("c"):
         machine.capture(croquis)  # same path the capture gesture takes
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

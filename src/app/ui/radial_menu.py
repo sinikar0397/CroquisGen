@@ -8,7 +8,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from ..types import Style
+from core.types import Style
 
 _SECTOR_LABELS = {
     Style.GESTURE_CROQUIS: ("Gesture", "Croquis"),

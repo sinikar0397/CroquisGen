@@ -6,9 +6,9 @@ from pathlib import Path
 
 import numpy as np
 
-from . import config
+from core import config
 from .gestures import Event, GestureEvent
-from .types import AppState, Style, Target
+from core.types import AppState, Style, Target
 
 
 class StateMachine:

@@ -14,8 +14,8 @@ from typing import Protocol
 import cv2
 import numpy as np
 
-from .. import config
-from ..types import PerceptionResult, Target
+from core import config
+from core.types import PerceptionResult, Target
 
 
 class CroquisRenderer(Protocol):
@@ -112,7 +112,7 @@ def body_scale(points: np.ndarray) -> float:
     Everything derived from this stays consistent whether the subject is close to
     the camera or far from it.
     """
-    from ..types import L_SHOULDER, R_SHOULDER
+    from core.landmarks import L_SHOULDER, R_SHOULDER
 
     span = float(np.linalg.norm(points[L_SHOULDER] - points[R_SHOULDER]))
     return max(span, 1.0)

@@ -15,13 +15,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from .types import (
-    L_ELBOW,
-    L_WRIST,
-    R_ELBOW,
-    R_WRIST,
-    PerceptionResult,
-)
+from core.landmarks import L_ELBOW, L_WRIST, R_ELBOW, R_WRIST
+from core.types import PerceptionResult
 
 # Palm centre sits roughly this far past the wrist, in forearm lengths.
 _PALM_OFFSET = 0.33

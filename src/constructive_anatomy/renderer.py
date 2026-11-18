@@ -9,14 +9,10 @@ import math
 import cv2
 import numpy as np
 
-from .. import config
-from ..types import (
-    L_ANKLE, L_EAR, L_ELBOW, L_EYE, L_FOOT_INDEX, L_HEEL, L_HIP, L_INDEX, L_KNEE,
-    L_PINKY, L_SHOULDER, L_WRIST, NOSE, PerceptionResult, R_ANKLE, R_EAR, R_ELBOW,
-    R_EYE, R_FOOT_INDEX, R_HEEL, R_HIP, R_INDEX, R_KNEE, R_PINKY, R_SHOULDER,
-    R_WRIST, Target,
-)
-from .base import blank_paper, scaled_points, visible
+from core import config
+from core.landmarks import L_ANKLE, L_EAR, L_ELBOW, L_EYE, L_FOOT_INDEX, L_HEEL, L_HIP, L_INDEX, L_KNEE, L_PINKY, L_SHOULDER, L_WRIST, NOSE, R_ANKLE, R_EAR, R_ELBOW, R_EYE, R_FOOT_INDEX, R_HEEL, R_HIP, R_INDEX, R_KNEE, R_PINKY, R_SHOULDER, R_WRIST
+from core.types import PerceptionResult, Target
+from render.base import blank_paper, scaled_points, visible
 
 INK = config.INK_COLOR
 PAPER = config.PAPER_COLOR

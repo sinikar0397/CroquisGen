@@ -14,8 +14,9 @@ from enum import Enum, auto
 
 import numpy as np
 
-from . import config
-from .types import INDEX_TIP, MIDDLE_TIP, PerceptionResult, Style, THUMB_TIP, WRIST
+from core import config
+from core.landmarks import INDEX_TIP, MIDDLE_TIP, THUMB_TIP, WRIST
+from core.types import PerceptionResult, Style
 
 # MediaPipe GestureRecognizer category names this app reacts to.
 GESTURE_CAPTURE = "Open_Palm"

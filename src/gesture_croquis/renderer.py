@@ -23,29 +23,11 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from .. import config
-from ..types import (
-    HAND_EDGES,
-    MIDDLE_TIP,
-    WRIST,
-    L_ANKLE,
-    L_ELBOW,
-    L_HIP,
-    L_KNEE,
-    L_SHOULDER,
-    L_WRIST,
-    NOSE,
-    PerceptionResult,
-    R_ANKLE,
-    R_ELBOW,
-    R_HIP,
-    R_KNEE,
-    R_SHOULDER,
-    R_WRIST,
-    Target,
-)
-from .base import blank_paper, body_scale, scaled_points, tapered_line, visible
-from .outline import draw_silhouette
+from core import config
+from core.landmarks import HAND_EDGES, L_ANKLE, L_ELBOW, L_HIP, L_KNEE, L_SHOULDER, L_WRIST, MIDDLE_TIP, NOSE, R_ANKLE, R_ELBOW, R_HIP, R_KNEE, R_SHOULDER, R_WRIST, WRIST
+from core.types import PerceptionResult, Target
+from render.base import blank_paper, body_scale, scaled_points, tapered_line, visible
+from render.outline import draw_silhouette
 
 # Limb chains drawn as single continuous strokes. Drawing a limb as one stroke
 # rather than two segments is what gives it flow.
