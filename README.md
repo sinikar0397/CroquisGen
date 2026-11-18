@@ -12,13 +12,13 @@
 
 ```bash
 pip install -r requirements.txt
-python scripts/download_models.py   # MediaPipe 모델 4개, 약 31 MB
+python scripts/download_models.py   # MediaPipe 모델 3개, 약 23 MB
 ```
 
 ## 실행
 
 ```bash
-python scripts/run.py
+python main.py
 ```
 
 | 옵션 | 효과 |
@@ -49,13 +49,31 @@ python scripts/run.py
 ## 구조
 
 ```
-src/croquisgen/
-  app.py          메인 루프
-  perception.py   MediaPipe pose / hand 래퍼
-  gestures.py     손동작 → 이벤트 변환
-  hand_roi.py     전신 골격에서 손 ROI 추출
-  state.py        모드·스타일 상태와 캡처 저장
-  renderers/      스타일별 생성기 (landmarks → 이미지)
-  ui/             원형 툴바, 상태 표시줄, 캡처 알림
-scripts/          실행·모델 다운로드·벤치마크·정지 이미지 렌더링
+main.py                  진입점
+src/
+  core/                  단계 간 계약 — 나머지 전부가 이것만 공유한다
+    types.py             PerceptionResult, AppState, Style, Target
+    landmarks.py         랜드마크 인덱스와 골격 엣지
+    config.py            튜너블 (프레임 예산에 영향을 주는 값은 비용 주석과 함께)
+  app/                   실시간 루프
+    loop.py              프레임 루프와 키 입력
+    camera.py            웹캠 입력
+    gestures.py          손동작 → 이벤트 변환
+    state.py             모드·스타일 상태와 캡처 저장
+    hand_roi.py          전신 골격에서 손 ROI 추출
+    ui/                  원형 툴바, 상태 표시줄, 캡처 알림
+  perception/            랜드마크 공급. 검출기를 갈아끼우는 지점
+    mediapipe_pose.py    MediaPipe Tasks pose / gesture
+  render/                드로잉 계약과 공용 도구
+    base.py              렌더러 프로토콜, 종이, 좌표 스케일, 획
+    outline.py           세그멘테이션 마스크 윤곽
+    registry.py          Style → 렌더러
+  gesture_croquis/       동세 크로키 — 사진→3D 골격 분석(S1~S3)과 렌더러
+  constructive_anatomy/  인체 도형화 렌더러
+scripts/                 모델 다운로드, 정지 이미지 렌더링
+tests/                   카메라·모델 없이 도는 테스트
 ```
+
+렌더러는 `PerceptionResult`만 보고 이미지를 돌려주는 순수 함수다. 카메라도 화면도
+앱 상태도 건드리지 않으므로, 스타일을 추가할 때 고칠 곳은 `core/types.py`의 `Style`,
+`render/registry.py`, `app/gestures.py`의 `style_for_direction()` 세 곳이다.

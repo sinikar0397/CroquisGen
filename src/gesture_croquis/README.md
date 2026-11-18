@@ -1,7 +1,12 @@
-# CroquisGen: S1–S3 (photo → 2D keypoints → physically fitted 3D skeleton + spine → static load)
+# 동세 크로키 S1–S3 (photo → 2D keypoints → physically fitted 3D skeleton + spine → static load)
+
+The analysis stages behind the gesture croquis style. `renderer.py` is the live
+renderer registered in `render/registry.py`; everything else here is the offline
+pipeline that feeds it, and it is not bound by the app's 30 ms frame budget.
 
 ```
-croquisgen/
+src/gesture_croquis/
+  renderer.py      live renderer (render/base.py contract). Currently a geometric placeholder
   skeleton.py      canonical 28-joint layout (Halpe-26 order + 2 hand points), bone-length priors, layout converters
   poseframe.py     PoseFrame dataclass = the stage contract, saved as .npz
   s1_keypoints.py  S1: YOLOX person detector + RTMPose (rtmlib). Default Halpe-26 (body + feet)
@@ -15,25 +20,25 @@ croquisgen/
   viz.py           interactive 3D HTML + static PNG (photo overlay, front/side/top)
   run.py           CLI / Pipeline class (models load once; reusable for webcam later)
   synthetic.py     ground-truth lunge pose for tests and --demo
-tests/test_s2_synthetic.py, tests/test_s3_physics.py, tests/test_plausibility.py, tests/test_physical_fit.py, tests/test_occlusion.py,
-tests/test_muscles.py, tests/test_limb_crossing.py
-croquis.py         M0 prototype (unchanged; S3–S5 still live here)
 ```
+
+The S2/S3 test suite (`test_s2_synthetic`, `test_s3_physics`, `test_plausibility`,
+`test_physical_fit`, `test_occlusion`, `test_muscles`, `test_limb_crossing`) and the
+M0 prototype `croquis.py` have not been brought over from the standalone project yet.
 
 ## Setup (once)
 ```bash
-cd ~/PycharmProjects/CroquisGen
-python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python -m pytest tests -q          # S2 recovers a known 3D pose (no models needed)
-python -m croquisgen.run --demo    # writes out/demo_3d.html + out/demo_views.png
 ```
 
 ## Run on a photo
+Run from `src/`, since the package resolves relative to it:
 ```bash
-python -m croquisgen.run --image photo.jpg                 # RTMPose-m Halpe-26 + RTMW3D-x depth
+cd src
+python -m gesture_croquis.run --demo                          # synthetic pose, no models needed
+python -m gesture_croquis.run --image photo.jpg               # RTMPose-m Halpe-26 + RTMW3D-x depth
 open out/photo_3d.html
-python -m croquisgen.run --images photos/ --out out/       # batch a folder
+python -m gesture_croquis.run --images photos/ --out out/     # batch a folder
 ```
 On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cache/rtmlib`.
 
@@ -179,7 +184,7 @@ No keypoint layout has spine landmarks, so the spine is **interpolated** from th
 5. **Muscle stress:** `s3_info.muscle_stress` holds per-group stress, activation, passive tension and normalised length; `stress_index`, `stress_peak`, `peak_stress_muscle` and `joint_stress` summarise it. `joint_effort` (the marker size in the 3D view) is now the per-joint maximum stress, divided by max(peak, 0.5) so a relaxed pose stays pale.
 6. **Stretch proxy:** joint flexion angles, shoulder elevation, spine bend/twist, and per-side torso strain (negative = compressed). This drives the straight-vs-curved stroke rule in S4.
 
-Synthetic checks (`tests/test_s3_physics.py`):
+Synthetic checks (`test_s3_physics.py`, not yet brought over):
 - a symmetric stance splits its weight 50/50;
 - the centre of pressure equals the centre of mass's ground position;
 - leaning 35° forward raises the L5 torque more than 3×;

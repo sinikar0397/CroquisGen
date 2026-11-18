@@ -9,7 +9,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from croquisgen.renderers.constructive import (  # noqa: E402
+from constructive_anatomy.renderer import (  # noqa: E402
     _BODY_CHAINS,
     _BODY_FOLLOWERS,
     LENGTH_TOLERANCE,
@@ -18,7 +18,7 @@ from croquisgen.renderers.constructive import (  # noqa: E402
     _foreshortening,
     _palm_outline,
 )
-from croquisgen.types import L_ELBOW, L_INDEX, L_PINKY, L_SHOULDER, L_WRIST  # noqa: E402
+from core.landmarks import L_ELBOW, L_INDEX, L_PINKY, L_SHOULDER, L_WRIST  # noqa: E402
 
 
 def test_overlong_forearm_is_pulled_in_and_hand_follows():

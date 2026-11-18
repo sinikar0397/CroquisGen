@@ -15,44 +15,56 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from croquisgen.gestures import (  # noqa: E402
+from app.gestures import (  # noqa: E402
     GESTURE_CAPTURE,
     GESTURE_POINT,
     Event,
     GestureInterpreter,
     style_for_direction,
 )
-from croquisgen.hand_roi import crop_with_padding, hand_roi_from_pose  # noqa: E402
-from croquisgen.renderers import get_renderer  # noqa: E402
-from croquisgen.state import StateMachine  # noqa: E402
-from croquisgen.types import (  # noqa: E402
-    INDEX_TIP,
-    L_ELBOW,
-    L_WRIST,
-    PerceptionResult,
-    Style,
-    Target,
-)
+from app.hand_roi import crop_with_padding, hand_roi_from_pose  # noqa: E402
+from render.registry import get_renderer  # noqa: E402
+from app.state import StateMachine  # noqa: E402
+from core.landmarks import INDEX_TIP, L_ELBOW, L_WRIST  # noqa: E402
+from core.types import PerceptionResult, Style, Target  # noqa: E402
 
 SIZE = (320, 240)
 
 
 def make_pose() -> np.ndarray:
-    """A roughly upright figure, normalised."""
+    """A roughly upright figure, normalised.
+
+    Every landmark the renderers read is filled in. Leaving one at the 0.5
+    default puts it in the middle of the chest, which looks like a plausible
+    coordinate but silently changes what the renderer draws - the constructive
+    renderer reads ears, heels and foot tips as well as the main joints.
+    """
     pose = np.full((33, 3), 0.5, dtype=np.float32)
     pose[0] = (0.50, 0.15, 0.0)    # nose
+    pose[2] = (0.48, 0.14, 0.0)    # left eye
+    pose[5] = (0.52, 0.14, 0.0)
+    pose[7] = (0.46, 0.15, 0.0)    # left ear
+    pose[8] = (0.54, 0.15, 0.0)
     pose[11] = (0.42, 0.30, 0.0)   # left shoulder
     pose[12] = (0.58, 0.30, 0.0)
     pose[13] = (0.38, 0.45, 0.0)   # left elbow
     pose[14] = (0.62, 0.45, 0.0)
     pose[15] = (0.35, 0.58, 0.0)   # left wrist
     pose[16] = (0.65, 0.58, 0.0)
+    pose[17] = (0.34, 0.61, 0.0)   # left pinky (pose model's hand extremity)
+    pose[18] = (0.66, 0.61, 0.0)
+    pose[19] = (0.35, 0.62, 0.0)   # left index
+    pose[20] = (0.65, 0.62, 0.0)
     pose[23] = (0.45, 0.58, 0.0)   # left hip
     pose[24] = (0.55, 0.58, 0.0)
     pose[25] = (0.44, 0.75, 0.0)   # left knee
     pose[26] = (0.56, 0.75, 0.0)
     pose[27] = (0.43, 0.92, 0.0)   # left ankle
     pose[28] = (0.57, 0.92, 0.0)
+    pose[29] = (0.43, 0.95, 0.0)   # left heel
+    pose[30] = (0.57, 0.95, 0.0)
+    pose[31] = (0.45, 0.97, 0.0)   # left foot index
+    pose[32] = (0.55, 0.97, 0.0)
     return pose
 
 
