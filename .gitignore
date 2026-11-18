@@ -5,6 +5,8 @@ __pycache__/
 .DS_Store
 .idea/
 .vscode/
+.ipynb_checkpoints/
+*.Rhistory
 
 # MediaPipe task bundles, ~31 MB. Fetch with scripts/download_models.py
 models/*.task
@@ -18,5 +20,11 @@ data/
 checkpoints/
 *.pth
 *.onnx
+
+# Local measurement tools, not part of the project
+tools/
+
+# gesture_croquis run outputs (.npz / 3d.html / views.png)
+out/
 
 CLAUDE.md
