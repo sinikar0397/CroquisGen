@@ -10,7 +10,7 @@ CroquisGen S1+S2 runner: image -> RTMPose 2D keypoints -> 3D skeleton -> visuali
     python -m croquisgen.run --image photo.jpg --views 0,90,-45:20 --layers ABC   # S4 extra views
 
 Stages: S1 RTMPose 2D -> S2 3D skeleton + spine curve -> S3 static load (T0) -> S4 gesture strokes.
-Outputs per image in --out:  <stem>.npz (PoseFrame)  <stem>_3d.html (interactive)  <stem>_views.png
+Outputs per image in --out:  <stem>.npz (PoseFrame); with --viz_3d also <stem>_3d.html + <stem>_views.png
                              <stem>_croquis[_y<yaw>_p<pitch>].png / .json (S4 strokes per view)
 """
 from __future__ import annotations
@@ -37,13 +37,14 @@ class Pipeline:
 
     def __init__(self, s1="halpe26", mode="balanced", s2="rtmw3d", height=1.70, device="cpu",
                  z_sign="-", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
-                 search=True, physical=True, label_swaps=True, workers=None, occlusion=True, jac="auto"):
+                 search=True, physical=True, label_swaps=True, workers=None, occlusion=True, jac="auto",
+                 solver="auto"):
         from .s1_keypoints import RTMPose2D
         t = time.perf_counter()
         self.s1 = RTMPose2D(s1, mode=mode, device=device)
         self.s2 = Lifter3D(s2, height=height, z_sign=z_sign, device=device, dynamic=dynamic, search=search,
                            physical=physical, mass=mass, label_swaps=label_swaps, workers=workers,
-                           occlusion=occlusion, jac=jac)
+                           occlusion=occlusion, jac=jac, solver=solver)
         self.s3 = dict(body_mass=mass, contacts=contacts, sagittal=sagittal) if s3 else None
         print(f"[init] models ready in {time.perf_counter() - t:.1f}s  (S1 device: {self.s1.device})")
 
@@ -83,15 +84,17 @@ class Timer:
         return _Lap()
 
 
-def write_outputs(frame, img, out_dir, stem, title, s4=None, timer=None):
+def write_outputs(frame, img, out_dir, stem, title, s4=None, timer=None, viz_3d=False):
+    """<stem>.npz always; the 3D diagnostics (<stem>_3d.html, <stem>_views.png) only with viz_3d."""
     T = timer or Timer()
     os.makedirs(out_dir, exist_ok=True)
     with T("out_npz"):
         frame.save(os.path.join(out_dir, f"{stem}.npz"))
-    with T("out_html"):
-        viz.make_html(frame, img, os.path.join(out_dir, f"{stem}_3d.html"), title=title)
-    with T("out_views_png"):
-        viz.make_png(frame, img, os.path.join(out_dir, f"{stem}_views.png"))
+    if viz_3d:
+        with T("out_html"):
+            viz.make_html(frame, img, os.path.join(out_dir, f"{stem}_3d.html"), title=title)
+        with T("out_views_png"):
+            viz.make_png(frame, img, os.path.join(out_dir, f"{stem}_views.png"))
     if s4 is not None:
         write_croquis(frame, img, out_dir, stem, timer=T, **s4)
     return T
@@ -120,7 +123,7 @@ def write_croquis(frame, img, out_dir, stem, views=("0",), layers="AB", exaggera
     return out
 
 
-def run_demo(out_dir, height, s3_kw=None, s4_kw=None):
+def run_demo(out_dir, height, s3_kw=None, s4_kw=None, viz_3d=False):
     """Synthetic lunge rendered as a stick-figure 'photo'; simulated depth cue. Tests S2 + viz only."""
     from .synthetic import lunge_pose
     hw = (960, 1280)
@@ -144,7 +147,7 @@ def run_demo(out_dir, height, s3_kw=None, s4_kw=None):
         print(summary_s3(f))
     t = time.perf_counter()
     T = write_outputs(f, img, out_dir, "demo", "CroquisGen S1+S2 · synthetic demo",
-                      s4=s4_kw if f.s3_info else None)
+                      s4=s4_kw if f.s3_info else None, viz_3d=viz_3d)
     print(timing_report(f, T, 1e3 * (time.perf_counter() - t) + f.s3_info.get("s3_ms", 0.0)))
     print(json.dumps({k: v for k, v in info.items() if k != "hinge"}, indent=1, default=float))
 
@@ -216,6 +219,12 @@ def main():
     ap.add_argument("--layers", default="AB",
                     help="S4 layers: A line of action, B gesture/rhythm, C construction volumes")
     ap.add_argument("--exaggeration", type=float, default=0.35, help="S4 line-of-action push (0.2-0.5)")
+    ap.add_argument("--viz_3d", "--viz-3d", dest="viz_3d", action="store_true",
+                    help="also write the 3D diagnostics: <stem>_3d.html (interactive) and <stem>_views.png "
+                         "(front/side/top). Off by default: they took 0.4-1.3 s per photo")
+    ap.add_argument("--solver", default="auto", choices=["auto", "lm", "scipy"],
+                    help="S2 optimiser with the JAX Jacobian: lm (default, small n x n solves) or scipy (trf, "
+                         "an SVD of the full Jacobian per step)")
     ap.add_argument("--profile", action="store_true",
                     help="cProfile each image: print the 25 slowest functions, save <out>/<stem>.prof")
     ap.add_argument("--demo", action="store_true")
@@ -226,7 +235,7 @@ def main():
     s4_kw = None if a.no_s4 else dict(views=[v for v in a.views.split(",") if v.strip()], layers=a.layers,
                                       exaggeration=a.exaggeration)
     if a.demo:
-        return run_demo(a.out, a.height, s3_kw, s4_kw)
+        return run_demo(a.out, a.height, s3_kw, s4_kw, viz_3d=a.viz_3d)
     paths = [a.image] if a.image else sorted(str(p) for p in Path(a.images).iterdir()
                                              if p.suffix.lower() in IMG_EXT)
     t_init = time.perf_counter()
@@ -234,7 +243,7 @@ def main():
                     mass=a.mass, contacts=contacts, sagittal=a.sagittal, dynamic=a.dynamic,
                     search=not a.no_search, physical=not a.no_physical,
                     label_swaps=not a.no_label_swaps, workers=a.workers, occlusion=not a.no_occlusion,
-                    jac=a.jac)
+                    jac=a.jac, solver=a.solver)
     print(f"[init] total {1e3 * (time.perf_counter() - t_init):.0f} ms (model loading, not counted per image)")
     for p in paths:
         t_img = time.perf_counter()
@@ -250,7 +259,7 @@ def main():
         K = default_K(img.shape[:2], fov_deg=a.fov, focal_35mm=exif_focal_35mm(p))
         f = pipe(img, K=K)
         stem = Path(p).stem
-        write_outputs(f, img, a.out, stem, f"CroquisGen S1+S2 · {Path(p).name}", timer=T)
+        write_outputs(f, img, a.out, stem, f"CroquisGen S1+S2 · {Path(p).name}", timer=T, viz_3d=a.viz_3d)
         i = f.s2_info
         print(f"{Path(p).name}: people {i['n_people']} | S1 det {i['s1_det_ms']:.0f} ms + pose "
               f"{i['s1_pose_ms']:.0f} ms | S2 {i['s2_total_ms']:.0f} ms | reproj {i['reproj_px_median']:.1f}px "

@@ -50,6 +50,8 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 | `--fov` | `55` | horizontal FOV used when the photo has no EXIF focal length |
 | `--z-sign` | `-` | RTMW3D depth sign. `-` is what real photos picked; `auto` fits both signs (2× the fits) |
 | `--jac` | `auto` | S2 Jacobian: exact via JAX (`auto`/`jax`, needs `pip install jax`) or finite differences (`fd`, ~10× slower) |
+| `--solver` | `auto` | S2 optimiser with the JAX Jacobian: `lm` (Levenberg–Marquardt, default) or `scipy` (trf) |
+| `--viz_3d` | off | also write the 3D diagnostics `<stem>_3d.html` and `<stem>_views.png` (0.4–1.3 s per photo) |
 | `--dynamic` | off | running/jumping/falling: no balance prior, low effort weight |
 | `--no-search` | off | skip the plausibility search over depth flips |
 | `--no-physical` | off | skip the integrated S2+S3 physical fit |
@@ -66,8 +68,10 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 Profiling showed about 90% of S2 in SciPy's finite-difference Jacobian: about 90 extra residual evaluations per solver step. `s2_jax.py` reimplements the same residuals in `jax.numpy`, and `fit_skeleton` passes their exact forward-mode Jacobian to `least_squares`. The covered residuals are the image terms, anatomy, twist, collision, occlusion order, physics and muscle stress.
 * **Fixed shapes.** Contacts and occlusion constraints are padded and masked, so one XLA compilation serves every fit. It is cached on disk in `~/.cache/croquisgen/jax`: about 17 s the first time on a machine, about 3 s per run after that. It is compiled at `Pipeline` start-up, not during the first image.
 * **Serial fits.** With JAX the fits run in the main process, so there is no process pool to start.
+* **Only rows that can be non-zero.** About 200 of the ~445 residual rows are padding or switched-off terms for a given problem. `row_mask()` drops them before the solver sees the Jacobian (`test_trimmed_rows_are_always_zero`).
+* **Levenberg–Marquardt solver (`--solver lm`, default).** SciPy's trf takes an SVD of the full Jacobian at every step: about 2 ms with one BLAS thread, 6.5 ms with several on an M-series Mac, which was most of S2 once the Jacobian was exact. `s2_jax.lm_solve` minimises the same robust objective (soft_l1, scale 3, column scaling like `x_scale="jac"`) by solving a small 87×87 system per step instead. It runs in Python around the compiled residual and Jacobian, so there is no extra compile time. `test_lm_solver_matches_scipy` requires the same optimum (cost within 1%, pose within 1 cm). On a side-bend pose without the depth cue, it stopped 0.5% higher in cost, with the pose 8 mm different. `--solver scipy` keeps trf.
 * **Numpy stays the reference.** `test_s2_jax.py` checks that the residuals are identical and that Jᵀr and JᵀJ match finite differences within 1e-4, on several problem variants. **If you edit a residual in s2_lift / biomech / muscles / plausibility / occlusion, mirror it in s2_jax.py**; the test fails until you do.
-* **Measured** on the synthetic lunge: one physics fit 2.66 s → 0.10 s; the whole S2 stage (all hypotheses, flip search, physical refinement) 15.6 s → 1.6 s, with the same winning pose and cost. Without jax installed, the old finite-difference path is used automatically.
+* **Measured** on the synthetic lunge: one physics fit 2.66 s → 0.10 s (SciPy trf) → 0.06–0.08 s (LM). The whole S2 stage went 15.6 s → 1.6 s with the exact Jacobian alone, with the same winning pose and cost. Without jax installed, the old finite-difference path and SciPy are used automatically.
 
 ## How S2 works
 One least-squares fit (`fit_skeleton`) of the canonical skeleton in the camera frame (metres):

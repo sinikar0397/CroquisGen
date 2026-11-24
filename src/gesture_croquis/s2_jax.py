@@ -443,12 +443,12 @@ def physics_residuals(X, pitch, s):
     h = -(C @ down)
     hmean = (h * cm).sum() / jnp.maximum(nc, 1.0)
     floor = (h - hmean) / 0.025 * cm
-    return jnp.concatenate([pw[0] * pr, pw[1] * sr, (pw[2] * bal)[None], pw[3] * floor,
-                            (pw[4] * _deg(pitch) / 8.0)[None]])
+    return [pw[0] * pr, pw[1] * sr, (pw[2] * bal)[None], pw[3] * floor, (pw[4] * _deg(pitch) / 8.0)[None]]
 
 
 # ============================================================================ full residual
-def residuals_full(p, s):
+def _pieces(p, s):
+    """Residual blocks in a fixed order (row_mask() mirrors it)."""
     Xp = p[:3 * J].reshape(J, 3)
     X = Xp[s["src"]]
     log_h, g = p[3 * J], jnp.concatenate([p[3 * J + 1:3 * J + 4], jnp.zeros(1)])
@@ -469,7 +469,7 @@ def residuals_full(p, s):
     res.append(wp * twist_terms(X))
     res.append(wp * collision_terms(X, s["height"], s["coll_ok"]) / 0.03)
     res.append(s["w_order"] * order_terms(X, s))
-    res.append(s["phys_on"] * physics_residuals(X, pitch, s))
+    res += [s["phys_on"] * r for r in physics_residuals(X, pitch, s)]
     res.append(jnp.stack([s["w_bal"] * balance_term(X)]))
     E = s["E"]
     dz = X[E[:, 1], 2] - X[E[:, 0], 2]
@@ -479,7 +479,11 @@ def residuals_full(p, s):
     cauchy = r * jnp.where(small, 1.0, jnp.sqrt(jnp.log1p(jnp.where(small, 1.0, r2)) / jnp.where(small, 1.0, r2)))
     res.append(s["w_depth"] * s["ew"] * cauchy)
     res.append(jnp.stack([s["use_depth"] * log_sz / 0.3]))
-    return jnp.concatenate(res)
+    return res
+
+
+def residuals_full(p, s):
+    return jnp.concatenate(_pieces(p, s))
 
 
 _F = _JAC = None
@@ -491,6 +495,36 @@ def _compiled():
         _F = jax.jit(residuals_full)
         _JAC = jax.jit(jax.jacfwd(residuals_full))
     return _F, _JAC
+
+
+_SHAPES = None
+
+
+def row_mask(spec):
+    """1 for residual rows that can be non-zero for this problem, 0 for padding / switched-off
+    terms (those are exactly 0, or a constant ~1e-44 barrier floor, for every parameter value).
+    Dropping them shrinks the matrices the solver factorises (#2)."""
+    global _SHAPES
+    if _SHAPES is None:
+        s0 = {k: jnp.asarray(v) for k, v in spec.items()}
+        _SHAPES = [x.shape[0] for x in jax.eval_shape(_pieces, jnp.zeros(NP), s0)]
+    n = _SHAPES
+    on = lambda w: float(np.asarray(w) != 0)
+    nc = float(np.asarray(spec["cmask"]).sum())
+    n_phys_pass_stress = n[9] + n[10]
+    blocks = [np.repeat(spec["wr"] > 0, 2), spec["bmask"] > 0, np.ones(n[2]), spec["smask"] > 0,
+              (spec["hinge_ok"] > 0) * on(spec["w_hinge"]),
+              np.full(n[5], on(spec["w_prior"])), np.full(n[6], on(spec["w_prior"])),
+              np.asarray(spec["coll_ok"]) * on(spec["w_prior"]),
+              np.r_[spec["om"], spec["pm"]] * on(spec["w_order"])]
+    ph = on(spec["phys_on"])
+    blocks += [np.full(n[9], ph), np.full(n[10], ph), np.full(1, ph * (nc > 0) * on(spec["pw"][2])),
+               spec["cmask"] * ph * on(spec["pw"][3]), np.full(1, ph)]
+    blocks += [np.full(1, on(spec["w_bal"])), (spec["ew"] != 0) * on(spec["w_depth"]),
+               np.full(1, on(spec["use_depth"]))]
+    m = np.concatenate([np.asarray(b, float).ravel() for b in blocks])
+    assert len(m) == sum(n), (len(m), sum(n))
+    return m
 
 
 # ============================================================================ spec from fit_skeleton
@@ -573,10 +607,12 @@ def build_spec(kpts2d, conf, K, height, valid, park, sig_px, use_depth, E=None, 
 
 
 def make_fun_jac(spec, cols, template):
-    """Callables for scipy.optimize.least_squares on the reduced parameter vector."""
+    """Callables for scipy.optimize.least_squares on the reduced parameter vector, returning only
+    the rows that can be non-zero (#2)."""
     F, JAC = _compiled()
     s = {k: jnp.asarray(v) for k, v in spec.items()}
     cols = np.asarray(cols)
+    rows = np.where(row_mask(spec) > 0)[0]
 
     def embed(p):
         full = template.copy()
@@ -584,15 +620,85 @@ def make_fun_jac(spec, cols, template):
         return full
 
     def fun(p):                       # np.array (copy): SciPy's robust loss scales these in place
-        return np.array(F(embed(p), s))
+        return np.array(F(embed(p), s))[rows]
 
     def jac(p):
-        return np.array(JAC(embed(p), s)[:, cols])
+        return np.array(JAC(embed(p), s))[np.ix_(rows, cols)]
     return fun, jac
 
 
+# ============================================================================ #3 Levenberg-Marquardt
+def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4):
+    """Robust (soft_l1, scale C) Levenberg-Marquardt around the compiled residual / Jacobian.
+
+    Same objective as scipy least_squares(loss="soft_l1", f_scale=C):
+        cost = 0.5 * C^2 * sum rho((r/C)^2),  rho(z) = 2 (sqrt(1+z) - 1)
+    The robust loss is handled like SciPy (Triggs correction): J~ = sqrt(w) J, r~ = rho' r / sqrt(w),
+    w = rho' + 2 rho'' z. Each step solves the small n x n system (J~'J~ + lam D^2) d = -J~'r~ with
+    D = running max of the column norms (SciPy's x_scale="jac"). SciPy's trf instead takes an SVD
+    of the full m x n Jacobian at every iteration, which was most of S2 after the exact Jacobian.
+    Returns (p, cost, nfev, njev, status: 1 gtol, 2 ftol, 3 xtol, 0 max_nfev)."""
+    C2 = C * C
+
+    def cost_of(r):
+        z = r * r / C2
+        return 0.5 * C2 * float(np.sum(2.0 * (np.sqrt(1.0 + z) - 1.0)))
+
+    def scaled(r, Jm):
+        z = r * r / C2
+        sw = (1.0 + z) ** -0.75                          # sqrt(rho' + 2 rho'' z) for soft_l1
+        return Jm * sw[:, None], r / np.sqrt(1.0 + z) / sw
+
+    p = np.asarray(p0, float).copy()
+    r, Jm = fun(p), jac(p)
+    cost = cost_of(r)
+    nfev = njev = 1
+    lam, nu = 1e-3, 2.0
+    D = None
+    status = 0
+    while nfev < max_nfev:
+        Jt, rt = scaled(r, Jm)
+        g = Jt.T @ rt
+        H = Jt.T @ Jt
+        dn = np.sqrt(np.diag(H))
+        dn = np.where(dn > 0, dn, 1.0)
+        D = dn if D is None else np.maximum(D, dn)
+        if np.max(np.abs(g / D)) < gtol:
+            status = 1
+            break
+        A = H + lam * np.diag(D * D)
+        try:
+            step = np.linalg.solve(A, -g)
+        except np.linalg.LinAlgError:
+            step = np.linalg.lstsq(A, -g, rcond=None)[0]
+        p_new = p + step
+        r_new = fun(p_new)
+        nfev += 1
+        c_new = cost_of(r_new)
+        pred = -(g @ step + 0.5 * step @ (H @ step))
+        actual = cost - c_new
+        ok = np.isfinite(c_new) and actual > 0 and pred > 0
+        ratio = actual / pred if pred > 0 else 0.0
+        if ok:
+            lam *= max(1.0 / 3.0, 1.0 - (2.0 * ratio - 1.0) ** 3)
+            nu = 2.0
+            fconv = actual < ftol * cost and ratio > 0.25
+            p, r, cost = p_new, r_new, c_new
+            Jm = jac(p); njev += 1
+            if fconv:
+                status = 2
+                break
+        else:
+            lam *= nu
+            nu *= 2.0
+        if np.linalg.norm(step) < xtol * (xtol + np.linalg.norm(p)):
+            status = 3
+            break
+    return p, cost, nfev, njev, status
+
+
 def warmup():
-    """Compile (or load from the persistent cache) the residual and its Jacobian once."""
+    """Compile (or load from the persistent cache) the residual and its Jacobian."""
     if not HAVE_JAX:
         return False
     from .synthetic import lunge_pose

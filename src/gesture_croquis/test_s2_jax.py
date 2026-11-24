@@ -43,9 +43,10 @@ def test_residuals_and_jacobian_match_numpy(physics, depth, cons):
     rng = np.random.default_rng(1)
     p = pb["p0"] + rng.normal(0, 0.01, len(pb["p0"]))      # off any special point
     r_np, r_jx = pb["residuals"](p), pb["fun"](p)
-    # same multiset of residuals (the JAX version also carries masked zeros)
-    a = np.sort(np.abs(np.r_[r_np, np.zeros(len(r_jx) - len(r_np))]))
-    assert np.allclose(a, np.sort(np.abs(r_jx)), atol=1e-7, rtol=1e-6)
+    # same multiset of residuals; the JAX side drops always-zero rows (#2), numpy keeps ~0 ones
+    a, b = np.sort(np.abs(r_np)), np.sort(np.abs(r_jx))
+    a, b = a[a > 1e-12], b[b > 1e-12]
+    assert len(a) == len(b) and np.allclose(a, b, atol=1e-7, rtol=1e-6)
     J_fd = approx_derivative(pb["residuals"], p, method="3-point")
     J_jx = pb["jac"](p)
     g_fd, g_jx = J_fd.T @ r_np, J_jx.T @ r_jx                # row order-free invariants
@@ -54,11 +55,41 @@ def test_residuals_and_jacobian_match_numpy(physics, depth, cons):
     assert np.linalg.norm(H_jx - H_fd) <= 1e-4 * np.linalg.norm(H_fd)
 
 
+def test_trimmed_rows_are_always_zero():
+    """#2: rows dropped by row_mask() stay (numerically) zero for any parameter value."""
+    from gesture_croquis.s2_jax import build_spec, row_mask, residuals_full, NP
+    import jax.numpy as jnp
+    for physics, depth, cons in ((True, True, True), (False, False, False)):
+        kw = _problem(lunge_pose(), physics, depth, cons)
+        pb = fit_skeleton(**kw, jac="jax", _probe=True)
+        rng = np.random.default_rng(3)
+        spec = pb["spec"]
+        m = row_mask(spec)
+        s = {k: jnp.asarray(v) for k, v in spec.items()}
+        for _ in range(3):
+            full = np.zeros(NP); full[pb["cols"]] = pb["p0"] + rng.normal(0, 0.05, len(pb["p0"]))
+            r = np.asarray(residuals_full(full, s))
+            assert np.abs(r[m == 0]).max() < 1e-20
+
+
+@pytest.mark.parametrize("pose", ["lunge", "bend"])
+def test_lm_solver_matches_scipy(pose):
+    """#3: the LM solver reaches the same optimum as SciPy's trf on the same exact Jacobian."""
+    X = lunge_pose() if pose == "lunge" else stand_pose(side_bend_deg=15)
+    for physics, depth, cons in ((True, True, True), (False, True, False)):
+        kw = _problem(X, physics, depth, cons)
+        Xs, _, i_s = fit_skeleton(**kw, jac="jax", solver="scipy", iters=150)
+        Xl, _, i_l = fit_skeleton(**kw, jac="jax", solver="lm", iters=150)
+        assert i_l["jac"] == "jax-lm"
+        assert i_l["cost"] <= i_s["cost"] * 1.01 + 1e-6
+        assert np.median(np.linalg.norm(Xl - Xs, axis=1)) < 0.01
+
+
 def test_fit_matches_finite_differences_and_is_faster():
     kw = _problem(lunge_pose(), physics=True, depth=True, cons=True)
-    fit_skeleton(**kw, jac="jax", iters=5)                  # compile outside the timing
+    fit_skeleton(**kw, jac="jax", solver="scipy", iters=5)  # compile outside the timing
     t = time.perf_counter(); Xf, _, inf_f = fit_skeleton(**kw, jac="fd", iters=120); t_fd = time.perf_counter() - t
-    t = time.perf_counter(); Xj, _, inf_j = fit_skeleton(**kw, jac="jax", iters=120); t_jx = time.perf_counter() - t
+    t = time.perf_counter(); Xj, _, inf_j = fit_skeleton(**kw, jac="jax", solver="scipy", iters=120); t_jx = time.perf_counter() - t
     print(f"\n  fit: finite differences {1e3 * t_fd:.0f} ms ({inf_f['nfev']} evals) | "
           f"JAX {1e3 * t_jx:.0f} ms ({inf_j['nfev']} evals, {inf_j['njev']} jacobians) | x{t_fd / t_jx:.1f}")
     assert inf_j["jac"] == "jax" and inf_f["jac"] == "fd"

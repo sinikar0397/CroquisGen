@@ -209,12 +209,14 @@ GROUP_NAMES = ["legs", "arms", "torso"]
 def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
                  w_hinge=1.0, w_depth=1.0, w_prior=1.0, iters=200, tol=1e-4,
                  height_sigma=0.07, prop_sigma=0.10, w_balance=1.0, physics=None, physics_p0=None,
-                 order_cons=None, w_order=1.0, jac="auto", _probe=False):
+                 order_cons=None, w_order=1.0, jac="auto", solver="auto", _probe=False):
     """Return (X (J,3) camera-frame metres, valid (J,), info).
     physics: optional biomech.Physics block — adds its residuals (passive muscle, gravity effort,
     balance, floor) and its parameters (camera pitch) to the same least-squares problem.
     jac: "auto" = exact Jacobian via JAX (s2_jax.py) when jax is installed, else finite
-    differences; "jax" = require JAX; "fd" = SciPy finite differences (the original path)."""
+    differences; "jax" = require JAX; "fd" = SciPy finite differences (the original path).
+    solver: "auto"/"lm" = Levenberg-Marquardt on the exact Jacobian (s2_jax.lm_solve, needs JAX);
+    "scipy" = scipy.optimize.least_squares (trf). Same robust objective either way."""
     from .plausibility import twist_terms, collision_terms
     from .occlusion import order_terms
     valid = conf > CONF_MIN
@@ -296,7 +298,7 @@ def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
         p0 = np.r_[p0, 0.0]
     if physics is not None:
         p0 = np.r_[p0, physics_p0 if physics_p0 is not None else np.zeros(physics.n_params)]
-    fun, jac_fn, jac_used = residuals, "2-point", "fd"
+    fun, jac_fn, jac_used, spec = residuals, "2-point", "fd", None
     if jac in ("auto", "jax"):
         from . import s2_jax
         if s2_jax.available():
@@ -316,10 +318,18 @@ def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
         elif jac == "jax":
             raise ImportError("fit_skeleton(jac='jax') needs `pip install jax`")
     if _probe:                                         # for tests: the problem, not the solution
-        return dict(residuals=residuals, p0=p0, fun=fun, jac=jac_fn, jac_used=jac_used)
+        return dict(residuals=residuals, p0=p0, fun=fun, jac=jac_fn, jac_used=jac_used, spec=spec,
+                    cols=cols if spec is not None else None)
     t0 = time.perf_counter()
-    sol = least_squares(fun, p0, jac=jac_fn, loss="soft_l1", f_scale=3.0, max_nfev=iters,
-                        x_scale="jac", method="trf", ftol=tol, xtol=1e-7, gtol=tol)   # xtol is relative to |x| (metres at 2-20 m): keep it tight
+    if jac_used == "jax" and solver in ("auto", "lm"):
+        from types import SimpleNamespace
+        px, cost, nfev, njev, status = s2_jax.lm_solve(fun, jac_fn, p0, C=3.0, max_nfev=iters,
+                                                       ftol=tol, xtol=1e-7, gtol=tol)
+        sol = SimpleNamespace(x=px, cost=cost, nfev=nfev, njev=njev, status=status)
+        jac_used = "jax-lm"
+    else:
+        sol = least_squares(fun, p0, jac=jac_fn, loss="soft_l1", f_scale=3.0, max_nfev=iters,
+                            x_scale="jac", method="trf", ftol=tol, xtol=1e-7, gtol=tol)   # xtol is relative to |x| (metres at 2-20 m): keep it tight
     X, log_sz, log_h, g = unpack(sol.x)
     reproj = np.linalg.norm(project(X[vi], K) - kpts2d[vi], axis=1)
     Lf = np.linalg.norm(X[bi[:, 0]] - X[bi[:, 1]], axis=1)
@@ -598,14 +608,14 @@ class Lifter3D:
                  device: str = "auto", dynamic: bool = False, search: bool = True,
                  physical: bool = True, mass: float | None = None, n_physical: int = 2,
                  label_swaps: bool = True, swap_prior: float = 3.0, workers: int | None = None,
-                 occlusion: bool = True, jac: str = "auto"):
+                 occlusion: bool = True, jac: str = "auto", solver: str = "auto"):
         self.backend, self.height, self.z_sign = backend, height, z_sign
         self.dynamic, self.search = dynamic, search
         self.physical, self.mass, self.n_physical = physical, mass, n_physical
         self.label_swaps, self.swap_prior, self.workers = label_swaps, swap_prior, workers
         self.occlusion = occlusion
         self.phys_tol = 1e-3
-        self.fit_kw = dict(w_balance=0.0 if dynamic else 1.0, jac=jac)
+        self.fit_kw = dict(w_balance=0.0 if dynamic else 1.0, jac=jac, solver=solver)
         self.depth = RTMW3DDepth(device) if backend == "rtmw3d" else None
         self.jac = "fd"
         if jac != "fd":
@@ -614,7 +624,8 @@ class Lifter3D:
                 t = time.perf_counter()
                 s2_jax.warmup()                       # compile once (or load the on-disk cache)
                 self.jac = "jax"
-                print(f"[S2] exact Jacobian via JAX (compile/cache load {time.perf_counter() - t:.1f}s)")
+                print(f"[S2] exact Jacobian via JAX, solver {'LM' if solver != 'scipy' else 'SciPy trf'} "
+                      f"(compile/cache load {time.perf_counter() - t:.1f}s)")
             elif jac == "jax":
                 raise ImportError("--jac jax needs `pip install jax`")
             else:
