@@ -36,7 +36,7 @@ class Pipeline:
     """Holds the loaded models so repeated calls (batch now, webcam later) skip re-loading."""
 
     def __init__(self, s1="halpe26", mode="balanced", s2="rtmw3d", height=1.70, device="cpu",
-                 z_sign="-", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
+                 z_sign="auto", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
                  search=True, physical=True, label_swaps=True, workers=None, occlusion=True, jac="auto",
                  solver="auto"):
         from .s1_keypoints import RTMPose2D
@@ -190,8 +190,9 @@ def main():
     ap.add_argument("--s2", default="rtmw3d", choices=["rtmw3d", "geometric"])
     ap.add_argument("--height", type=float, default=1.70, help="subject height prior, metres")
     ap.add_argument("--fov", type=float, default=55.0, help="horizontal FOV if no EXIF focal length")
-    ap.add_argument("--z-sign", default="-", choices=["auto", "+", "-"],
-                    help="RTMW3D depth sign. Default '-' (what real photos picked); 'auto' fits both (2x the fits)")
+    ap.add_argument("--z-sign", default="auto", choices=["auto", "+", "-"],
+                    help="RTMW3D depth sign: 'auto' (default) fits both and keeps the better; '+'/'-' fixes it "
+                         "(half the fits, but a wrong sign mirrors the whole pose in depth)")
     ap.add_argument("--jac", default="auto", choices=["auto", "jax", "fd"],
                     help="S2 Jacobian: exact via JAX (auto, if installed) or finite differences (fd, slow)")
     ap.add_argument("--device", default="cpu",

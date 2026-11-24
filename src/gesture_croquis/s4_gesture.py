@@ -865,6 +865,7 @@ def summary(c: Croquis) -> str:
 
 # ============================================================================== preview (MVP S5)
 INK = {"A": (25, 25, 25), "B": (35, 35, 35), "C": (200, 170, 140)}   # BGR
+LOA_COLOR = (40, 40, 220)            # BGR red: the line of action stands out from the rest
 
 
 def _draw_stroke(img, pts, w, color, closed):
@@ -887,9 +888,11 @@ def _draw_stroke(img, pts, w, color, closed):
 
 
 def render_preview(c: Croquis, size=None, bg=None, fit=True, margin=0.08, supersample=2,
-                   layers=None, color=None):
+                   layers=None, color=None, loa_color=LOA_COLOR):
     """Rasterise the strokes. size=(H,W): output canvas (default: the view canvas). fit=True scales
-    the drawing into the canvas; fit=False keeps view px (overlay on the photo, pass it as bg)."""
+    the drawing into the canvas; fit=False keeps view px (overlay on the photo, pass it as bg).
+    color recolours the other strokes; the line of action (layer A) is drawn in loa_color
+    (red by default; loa_color=None gives it the same colour as the rest)."""
     import cv2
     layers = layers or "ABC"
     H, W = size or c.canvas_hw
@@ -909,7 +912,7 @@ def render_preview(c: Croquis, size=None, bg=None, fit=True, margin=0.08, supers
         canvas = cv2.resize(bg, (W * ss, H * ss), interpolation=cv2.INTER_LINEAR)
     order = sorted(strokes, key=lambda s: {"C": 0, "B": 1, "A": 2}[s.layer])
     for s in order:
-        col = color or INK[s.layer]
+        col = (loa_color or color or INK["A"]) if s.layer == "A" else (color or INK[s.layer])
         _draw_stroke(canvas, (s.pts * sc + off) * ss, np.maximum(s.width * sc * ss, 0.0), col, s.closed)
     return cv2.resize(canvas, (W, H), interpolation=cv2.INTER_AREA)
 
@@ -923,7 +926,7 @@ def preview_panel(c: Croquis, photo=None, height=900, layers=None):
     tiles = []
     if photo is not None and c.view.is_photo:
         faded = (photo.astype(np.float32) * 0.45 + 140).clip(0, 255).astype(np.uint8)
-        ov = render_preview(c, (h0, w0), bg=faded, fit=False, color=(40, 40, 220), layers=layers)
+        ov = render_preview(c, (h0, w0), bg=faded, fit=False, color=(150, 80, 20), layers=layers)   # blue + red LOA
         tiles.append(cv2.resize(ov, (W, height), interpolation=cv2.INTER_AREA))
     tiles.append(clean)
     out = np.hstack(tiles)

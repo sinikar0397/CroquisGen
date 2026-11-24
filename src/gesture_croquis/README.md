@@ -71,7 +71,7 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 | `--s2` | `rtmw3d` | `rtmw3d` (depth network) or `geometric` (no 3D net, rough) |
 | `--height` | `1.70` | subject height prior in metres. Sets bone lengths and therefore the distance to the camera |
 | `--fov` | `55` | horizontal FOV used when the photo has no EXIF focal length |
-| `--z-sign` | `-` | RTMW3D depth sign. `-` is what real photos picked; `auto` fits both signs (2× the fits) |
+| `--z-sign` | `auto` | RTMW3D depth sign: `auto` fits both signs and keeps the better one. `+`/`-` fix it (half the fits), but a wrong sign mirrors the whole pose in depth: `-` reversed the torso lean and the knife arm on `e3020084…` |
 | `--jac` | `auto` | S2 Jacobian: exact via JAX (`auto`/`jax`, needs `pip install jax`) or finite differences (`fd`, ~10× slower) |
 | `--solver` | `auto` | S2 optimiser with the JAX Jacobian: `lm` (Levenberg–Marquardt, default) or `scipy` (trf) |
 | `--viz_3d` | off | also write the 3D diagnostics `<stem>_3d.html` and `<stem>_views.png` (0.4–1.3 s per photo) |
@@ -274,7 +274,7 @@ Output: `<stem>_croquis[<view>].json` holds the strokes in view pixels with per-
 - **front / behind:** where two layer-B strokes cross (excluding end-to-end touches and strokes of the same group), the one more than 3 cm nearer gets an accent and the farther one thins to a "lost line". This is the overlap/T-junction cue. The LOA is abstract and takes no part.
 - All weights are in `S4Params`.
 
-**Preview.** `render_preview` and `preview_panel` draw quads with round joins at 2× supersampling. This is a stand-in for S5 (skia/pycairo, SVG per layer), which can consume the JSON strokes as they are.
+**Preview.** `render_preview` and `preview_panel` draw quads with round joins at 2× supersampling. The line of action is drawn in red (`LOA_COLOR`), even when `color=` recolours the other strokes. Pass `loa_color=None` for one colour throughout. This is a stand-in for S5 (skia/pycairo, SVG per layer), which can consume the JSON strokes as they are.
 
 **Not yet:** the learned stroke stylisation, velocity/follow-through cues for airborne poses (`info.airborne` and `com_offset_m` are passed through for that), and a sagittal torso squash beyond what the muscle lengths give.
 
