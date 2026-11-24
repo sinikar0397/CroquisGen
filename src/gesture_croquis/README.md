@@ -1,11 +1,12 @@
 # CroquisGen: S1–S4 (photo → 2D keypoints → physically fitted 3D skeleton + spine → static load → gesture strokes)
 
 ```
-croquisgen/
+gesture_croquis/
   skeleton.py      canonical 28-joint layout (Halpe-26 order + 2 hand points), bone-length priors, layout converters
   poseframe.py     PoseFrame dataclass = the stage contract, saved as .npz
   s1_keypoints.py  S1: YOLOX person detector + RTMPose (rtmlib). Default Halpe-26 (body + feet)
   s2_lift.py       S2: metric 3D skeleton fit (RTMW3D depth cue, or geometric 2D-only fallback)
+  s2_jax.py        S2: the same residuals in jax.numpy + exact Jacobian + an LM solver (10x faster)
   plausibility.py  S2: pose plausibility energy + exact depth-flip search
   occlusion.py     S2: limb-in-front/behind-torso order from body-part contours (image edges)
   biomech.py       S2+S3: relaxed-posture prior, gravity torques, balance, floor, pitch
@@ -16,14 +17,36 @@ croquisgen/
   viz.py           interactive 3D HTML + static PNG (photo overlay, front/side/top)
   run.py           CLI / Pipeline class (models load once; reusable for webcam later)
   synthetic.py     ground-truth lunge pose for tests and --demo
-tests/test_s2_synthetic.py, tests/test_s3_physics.py, tests/test_plausibility.py, tests/test_physical_fit.py, tests/test_occlusion.py,
-tests/test_muscles.py, tests/test_limb_crossing.py, test_s4_gesture.py (in this folder for now; move it to tests/)
-croquis.py         M0 prototype (unchanged; its S4 is superseded by s4_gesture.py, S5 still lives here)
+  renderer.py      the live app's renderer: S4 in 2D mode, or a cheap geometric stand-in
+  realtime.py      PerceptionResult (MediaPipe) → PoseFrame, so S4 can run without S1–S3
+  test_s2_jax.py, test_s4_gesture.py   (in this folder for now; move them to tests/)
 ```
 
-The S2/S3 test suite (`test_s2_synthetic`, `test_s3_physics`, `test_plausibility`,
-`test_physical_fit`, `test_occlusion`, `test_muscles`, `test_limb_crossing`) and the
-M0 prototype `croquis.py` have not been brought over from the standalone project yet.
+The S2/S3 test suite from the standalone project (`test_s2_synthetic`,
+`test_s3_physics`, `test_plausibility`, `test_physical_fit`, `test_occlusion`,
+`test_muscles`, `test_limb_crossing`) has not been brought over yet. Neither has
+the M0 prototype `croquis.py`, whose S4 is superseded by `s4_gesture.py` but
+which still holds the only S5.
+
+## In the live app (`realtime.py`, `renderer.py`)
+
+S1–S3 are far too slow for a webcam frame, but S4 on its own is not: `BodyView`
+falls back to the 2D keypoints when `frame.joints3d` is None, and the live loop
+only ever wants the photo view. `realtime.pose_frame` maps MediaPipe's 33
+landmarks onto the canonical 28 joints and builds a 2D-mode `PoseFrame`;
+`renderer.py` calls `build_croquis` and rasterises the strokes.
+
+This is the default engine in the app. It costs about 56 ms a frame, so the
+croquis updates roughly 13 times a second while the camera and the gesture UI
+keep their own rate. `python main.py --placeholder` switches to the geometric
+stand-in.
+
+What 2D mode gives up: novel views, and the depth-ordered terms in the line
+weight model (near, front/behind). Running without S3 also zeroes the effort and
+support terms. MediaPipe's metric `pose_world` looks like it could feed the 3D
+path and skip S2, but those coordinates are hip-centred while `BodyView.proj`
+divides by z as a distance from the camera — placing the body at its true depth
+is a fit, and that belongs in S2.
 
 ## Setup (once)
 ```bash

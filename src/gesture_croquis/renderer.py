@@ -2,12 +2,26 @@
 
 Owner: 박준현.
 
-What is here now is a geometric placeholder, not the planned model. It draws the
-line of action and tapered limb strokes directly from landmarks, which is enough
-for the rest of the app to run end to end and gives the model something to be
-compared against.
+Two engines, picked by config.GESTURE_CROQUIS_ENGINE.
 
-The planned replacement is an unpaired skeleton -> croquis model trained
+**"s4"** (default) runs this package's real abstraction stage,
+s4_gesture.build_croquis, in its 2D mode: candidate line-of-action chains scored
+and fitted as cubic Béziers, rhythm lines per limb, torso squash, and the
+line-weight model. About 56 ms, which the threaded loop absorbs by letting the
+render stage fall behind the camera - roughly 13 croquis a second. See realtime.py
+for how a PerceptionResult becomes the PoseFrame it wants, and what 2D mode gives
+up (novel views and the depth-ordered weight terms).
+
+**"placeholder"** draws the line of action and tapered limb strokes straight from
+the landmarks. Geometric, about 7 ms, and the only one that fits a 30 fps budget
+on its own. It is what `--placeholder` selects, what the hand target always
+draws, and where a frame S4 cannot handle falls back to.
+
+S4 is still missing S5, the stroke stylisation, and it runs without S3, so the
+effort and support terms in the weight model read as zero: the line weights come
+from role, taper and 2D compression only.
+
+The planned further replacement is an unpaired skeleton -> croquis model trained
 CycleGAN-style, since no paired dataset exists. When it lands, it only has to keep
 the render() signature below; everything it needs is already in PerceptionResult
 (2D landmarks, visibility, metric 3D landmarks, segmentation mask).
@@ -29,6 +43,8 @@ from core.types import PerceptionResult, Target
 from render.base import blank_paper, body_scale, scaled_points, tapered_line, visible
 from render.outline import draw_silhouette
 
+from . import realtime
+
 # Limb chains drawn as single continuous strokes. Drawing a limb as one stroke
 # rather than two segments is what gives it flow.
 _LIMB_CHAINS = (
@@ -41,15 +57,59 @@ _LIMB_CHAINS = (
 
 class GestureCroquisRenderer:
     name = "Gesture Croquis"
+    # No frame-to-frame state, so the render stage may run several of these at
+    # once. The constructive renderer smooths across frames and cannot.
+    stateless = True
+
+    def __init__(self) -> None:
+        # Why the last S4 failure is kept instead of raised: a renderer that
+        # throws kills the render thread, and an unusual pose is not a bug worth
+        # stopping the app for. Read it when a croquis looks wrong.
+        self.last_s4_error: str | None = None
 
     def render(
         self, result: PerceptionResult, target: Target, size: tuple[int, int]
     ) -> np.ndarray:
+        # Read per frame so --s4 can switch engines without rebuilding anything.
+        # The hand target has no S4 path: every stage of it is about a body.
+        if config.GESTURE_CROQUIS_ENGINE == "s4" and target is not Target.HAND:
+            canvas = self._draw_s4(result, size)
+            if canvas is not None:
+                return canvas
+
         canvas = blank_paper(size)
         if target is Target.HAND:
             self._draw_hand(canvas, result, size)
         else:
             self._draw_body(canvas, result, size)
+        return canvas
+
+    def _draw_s4(
+        self, result: PerceptionResult, size: tuple[int, int]
+    ) -> np.ndarray | None:
+        """build_croquis in 2D mode, rasterised onto paper. None = fall back.
+
+        Imported here rather than at module scope so the placeholder engine
+        never pays for loading S4 and its dependencies.
+        """
+        from . import s4_gesture
+
+        frame = realtime.pose_frame(result, size)
+        if frame is None:
+            return None  # nobody in the frame: the placeholder returns blank paper
+        try:
+            croquis = s4_gesture.build_croquis(frame, layers=config.S4_LAYERS)
+            # fit=False keeps the strokes in the canvas's own pixels, which is
+            # what realtime.pose_frame set img_hw to. supersample=1 because the
+            # 2x pass costs more than the anti-aliasing is worth here.
+            canvas = s4_gesture.render_preview(
+                croquis, size=(size[1], size[0]), bg=blank_paper(size), fit=False,
+                supersample=1, color=config.INK_COLOR,
+            )
+        except Exception as exc:  # noqa: BLE001 - see last_s4_error above
+            self.last_s4_error = f"{type(exc).__name__}: {exc}"
+            return None
+        self.last_s4_error = None
         return canvas
 
     def _draw_body(

@@ -27,6 +27,9 @@ python main.py
 | `--show-camera` | 크로키 대신 카메라 원본을 표시 (제스처 디버깅용) |
 | `--no-snap` | 핑거스냅 인식 비활성화 |
 | `--camera N` | 카메라 장치 번호 |
+| `--placeholder` | 동세 크로키를 가벼운 기하 근사로 (기본은 S4) |
+| `--no-threads` | 캡처·인식·렌더를 한 스레드에서 (기준선) |
+| `--render-workers N` | 렌더 스레드 수 (기본 1) |
 
 ## 조작
 
@@ -56,7 +59,8 @@ src/
     landmarks.py         랜드마크 인덱스와 골격 엣지
     config.py            튜너블 (프레임 예산에 영향을 주는 값은 비용 주석과 함께)
   app/                   실시간 루프
-    loop.py              프레임 루프와 키 입력
+    loop.py              스레드 루프 · 단일 스레드 루프 · 키 입력
+    pipeline.py          단계 사이의 최신값 슬롯과 워커 스레드
     camera.py            웹캠 입력
     gestures.py          손동작 → 이벤트 변환
     state.py             모드·스타일 상태와 캡처 저장
@@ -68,8 +72,14 @@ src/
     base.py              렌더러 프로토콜, 종이, 좌표 스케일, 획
     outline.py           세그멘테이션 마스크 윤곽
     registry.py          Style → 렌더러
-  gesture_croquis/       동세 크로키 — 사진→3D 골격 분석(S1~S3)과 렌더러
+  gesture_croquis/       동세 크로키
+    renderer.py          실시간 렌더러 (S4 엔진 / 기하 근사 두 가지)
+    realtime.py          PerceptionResult → PoseFrame 어댑터
+    s1_keypoints.py …    사진 한 장에서 3D 골격까지 (S1~S3)
+    s4_gesture.py        골격 → 스트로크 추상화 (S4)
   constructive_anatomy/  인체 도형화 렌더러
 scripts/                 모델 다운로드, 정지 이미지 렌더링
 tests/                   카메라·모델 없이 도는 테스트
+tools/                   프레임 예산 측정 (저장소에서 추적하지 않음)
 ```
+

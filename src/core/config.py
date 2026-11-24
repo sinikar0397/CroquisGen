@@ -61,3 +61,36 @@ MENU_SELECT_RADIUS = 0.12
 PAPER_COLOR = (238, 240, 244)  # BGR, warm off-white
 INK_COLOR = (48, 44, 40)
 TOAST_FRAMES = 60
+
+# How many threads the render stage runs. Only read by the threaded loop, and
+# only honoured for renderers that declare themselves stateless - the
+# constructive renderer smooths across frames and has to stay on one thread.
+# Workers claim different frames and drop their result if a later frame was
+# already published, so extra workers buy throughput, never ordering.
+#
+# 1 is right on this machine (4 performance cores), including for the S4 engine.
+# S4 alone scales 1.4x on two threads and 1.7x on three, but that disappears
+# once the perception stage is running beside it: 1.2x on two, and three threads
+# come out *worse* than two. Measured with tools/bench_threading.py and
+# tools/smoke_threading.py --s4 --workers 1 2 3. Worth retrying on a machine with
+# more performance cores.
+RENDER_WORKERS = 1
+
+# Which gesture-croquis implementation renders.
+#   "s4"          ~56 ms  the real S1-S4 abstraction, in its 2D mode
+#   "placeholder"  ~7 ms  geometric lines straight from the landmarks
+# S4 is the default: it is the drawing the project is actually for, and the
+# placeholder was only ever a stand-in. It costs most of twice the whole frame
+# budget, so the croquis updates about 13 times a second in the threaded loop
+# while the camera runs at 49 and the gesture UI stays at the display rate.
+# Holding a pose works; a moving pose visibly trails. Getting it to 30 means
+# cutting S4's own cost - the line-of-action search is 39 ms of the 56, fitting a
+# cubic Bezier per candidate chain. `--placeholder` goes back to the cheap one,
+# which is also what the hand target always draws. See
+# gesture_croquis/realtime.py for what 2D mode gives up.
+GESTURE_CROQUIS_ENGINE = "s4"
+# S4 layers: A line of action, B rhythm/torso, C construction volumes. "C" is a
+# mannequin hint and costs little, but it fights the loose look of a croquis.
+S4_LAYERS = "AB"
+# Subject height prior. Sets S4's stroke scale; it does not need to be exact.
+BODY_HEIGHT_M = 1.70

@@ -22,6 +22,12 @@ class CroquisRenderer(Protocol):
     """Implemented by each croquis style."""
 
     name: str
+    # True when render() keeps nothing between calls, which lets the threaded
+    # loop run several render workers over different frames. This is the one
+    # thing the loop needs to know beyond render() itself, and it is a statement
+    # about the renderer, not a threading API: a renderer that smooths across
+    # frames says False and is called from a single thread, as before.
+    stateless: bool = False
 
     def render(
         self, result: PerceptionResult, target: Target, size: tuple[int, int]

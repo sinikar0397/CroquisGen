@@ -6,6 +6,8 @@
     python main.py --show-camera        크로키 대신 카메라 원본 표시
     python main.py --no-snap            핑거스냅 인식 끄기
     python main.py --camera 1           카메라 장치 번호
+    python main.py --no-threads         캡처·인식·렌더를 한 스레드에서 (기준선)
+    python main.py --placeholder        동세 크로키를 가벼운 기하 근사로 (S4가 기본)
 
 src/ is put on the path here rather than in a helper module, so there is no
 import-order requirement: sys.path has to be set before `from app.loop import

@@ -378,6 +378,9 @@ def _add_chain(scene, points, depth, chain, segments, unit, thick, thin, *,
 
 class ConstructiveRenderer:
     name = "Constructive Anatomy"
+    #프레임 간 스무딩과 체형 선택 상태를 들고 있어 호출 순서가 결과를 바꾼다.
+    #렌더 스테이지는 이 값을 보고 워커를 하나로 묶는다 (render/base.py 참고)
+    stateless = False
 
     def __init__(self):
         self._pose_filter = _Smoother()
