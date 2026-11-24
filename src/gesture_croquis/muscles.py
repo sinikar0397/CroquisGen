@@ -59,6 +59,54 @@ TRUNK_DOFS = {
                    [("neck_flexors", +1, 0.020, 0.08, 20), ("neck_extensors", -1, 0.030, 0.10, 40)]),
 }
 
+# ----------------------------------------------------------------------------------------
+# Passive stiffness calibrated to the range of motion
+# ----------------------------------------------------------------------------------------
+# The L0 values above set the ACTIVE force-length curve. Used for passive tension too, they made
+# the quadriceps 1.44x their optimal length at 60 deg of knee flexion (~80 N·m of passive pull),
+# so any bent, loaded knee looked strenuous and the fit straightened knees and hips that the
+# photo shows bent.
+# Measured passive joint moments stay small through the normal range and rise only near its end
+# (e.g. Riener & Edrich 1999 for hip/knee/ankle). So each group's effective length L0 (fibre +
+# tendon compliance + pennation, lumped) FOR PASSIVE TENSION is set so that the tension reaches
+# PASSIVE_AT_ROM of maximum exactly at the end of the normal passive range in the direction that
+# stretches it:  L0_passive = r * |limit - rest| / strain(PASSIVE_AT_ROM). Active force-length
+# keeps L0 from the table above.
+# Ranges (deg, in the angle conventions of biomech.joint_angles / extra_angles), adult norms:
+PASSIVE_ROM = {
+    "hip_flex": (-20.0, 120.0),     # extension .. flexion (knee bent)
+    "hip_abd": (-25.0, 45.0),       # adduction .. abduction
+    "knee_flex": (-5.0, 140.0),     # hyperextension blocked early
+    "ankle": (-45.0, 20.0),         # plantarflexion .. dorsiflexion
+    "sho_flex": (-55.0, 170.0),
+    "sho_abd": (-15.0, 170.0),
+    "elbow_flex": (-10.0, 145.0),   # many adults extend ~5-10 deg past straight
+    "trunk_flex": (-25.0, 60.0),    # lumbar share of the sagittal lean
+    "trunk_bend": (-35.0, 35.0),
+    "neck_flex": (-55.0, 50.0),
+}
+PASSIVE_AT_ROM = 0.3
+
+
+def _strain_at(fp):
+    """Normalised fibre strain at which the Thelen passive curve reaches fp."""
+    return _E0 / _KPE * np.log(1.0 + fp * (np.exp(_KPE) - 1.0))
+
+
+def _passive_lengths():
+    x = _strain_at(PASSIVE_AT_ROM)
+    out = {}
+    for table in (DOFS, TRUNK_DOFS):
+        for dof, (key, jnt, axk, rest, grp) in table.items():
+            lo, hi = PASSIVE_ROM[dof]
+            for g, side, r, _L0, M in grp:
+                limit = lo if side > 0 else hi    # an agonist (+1) is stretched as the angle decreases
+                out[g] = r * np.radians(abs(limit - rest)) / x
+    return out
+
+
+L0_PASSIVE = _passive_lengths()       # group -> effective length for passive tension (m)
+
 
 def passive(lt):
     x = np.maximum(lt - 1.0, 0.0)
@@ -124,8 +172,8 @@ def muscle_stress(X, down, frames, angles, tau_by_joint):
         jname = (prefix + jnt) if prefix else jnt
         tau = tau_by_joint.get(jname)
         m_req = 0.0 if tau is None else float(-(tau @ ax[(prefix + axk) if prefix else axk]))
-        lts = [1.0 - side * r * th / L0 for _, side, r, L0, _ in grp]      # agonist shortens
-        fps = [float(passive(lt)) for lt in lts]
+        lts = [1.0 - side * r * th / L0 for _, side, r, L0, _ in grp]      # agonist shortens (active)
+        fps = [float(passive(1.0 - side * r * th / L0_PASSIVE[g])) for g, side, r, _, _ in grp]
         m_pas = sum(side * fp * Mmax for (_, side, r, L0, Mmax), fp in zip(grp, fps))
         m_act = m_req - m_pas
         for (gname, side, r, L0, Mmax), lt, fp in zip(grp, lts, fps):

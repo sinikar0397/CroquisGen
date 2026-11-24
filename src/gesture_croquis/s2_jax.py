@@ -387,7 +387,7 @@ def stress_residuals(X, down, F, angles, tau_by_joint):
         tau = tau_by_joint.get(jname)
         m_req = 0.0 if tau is None else -(tau @ ax[(prefix + axk) if prefix else axk])
         lts = [1.0 - side * r * th / L0 for _, side, r, L0, _ in grp]
-        fps = [_m_passive(lt) for lt in lts]
+        fps = [_m_passive(1.0 - side * r * th / MU.L0_PASSIVE[g]) for g, side, r, _, _ in grp]
         m_pas = sum(side * fp * Mmax for (_, side, r, L0, Mmax), fp in zip(grp, fps))
         m_act = m_req - m_pas
         for (gname, side, r, L0, Mmax), lt, fp in zip(grp, lts, fps):

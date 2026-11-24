@@ -147,14 +147,16 @@ S2 and S3 are now one procedure. The 3D pose is fitted *with* the body's mechani
 **Unified muscle effort-stress (`muscles.py`):** one number per muscle group that combines what gravity asks of the muscle with how far it is stretched or shortened from its relaxed length.
 - Every degree of freedom (hip flex/abd, knee, ankle, shoulder flex/abd, elbow, trunk flex, trunk side-bend, neck) has an agonist/antagonist pair with a moment arm r, an optimal fibre length L0 and a maximal moment M_max (lumped OpenSim-order values).
 - **Length:** normalised fibre length l~ = 1 ∓ r·(θ − θ_relaxed)/L0. Flexing shortens the flexors and stretches the extensors.
-- **Passive tension** (Thelen 2003): F_p = (e^{4(l~−1)/0.6} − 1)/(e^4 − 1) for l~ > 1.
+- **Passive tension** (Thelen 2003): F_p = (e^{4(l~−1)/0.6} − 1)/(e^4 − 1) for l~ > 1, computed with a separate **range-of-motion-calibrated length** `L0_PASSIVE` (see below). Active force-length keeps L0.
 - **Force-length:** f_l = exp(−(l~−1)²/0.45). A very short or very long muscle is weaker.
 - **Demand:** the moment the muscles must supply, from gravity + ground reaction (the static solve), minus what passive tension already provides. Activation a = M_active / (M_max·f_l) of the group on the needed side.
 - **Stress** s = √(a² + F_p²): 0 = slack and idle, 1 = maximal. The **stress index** is the RMS over all groups.
 
 So holding a load with a short (weak) muscle costs more than the same load at mid-length, and a pose that stretches a muscle costs even with no load. The fit minimises Σs² (weight 3) together with the relaxed-posture prior (weight 0.7, which also covers axial rotations, foot turn-out and head yaw that have no muscle pair). Shoulder/hip flexion and abduction use an elevation-plane split, which stays defined for arms raised to 90° and beyond.
 
-Typical values (synthetic): relaxed stance 0.03 · arm held forward 0.10 (shoulder flexors 0.53) · arm held sideways 0.13 (abductors 0.70) · 40° backward lean 0.12+.
+Typical values (synthetic, ROM-calibrated): relaxed stance 0.05 · 40° forward lean 0.13 (back extensors 0.32) · throwing lunge 0.22 (hip flexors 0.62).
+
+**Passive stiffness calibrated to range of motion (`PASSIVE_ROM` in `muscles.py`).** With the lumped L0 also used for passive tension, the quadriceps were already 1.44× their optimal length at 60° of knee flexion: about 80 N·m of passive pull that the hamstrings had to cancel. Any bent, loaded knee or hip therefore looked strenuous, and the fit straightened joints that photos show bent. Now each group's passive tension reaches 30% of maximum (`PASSIVE_AT_ROM`) exactly at the end of the normal passive range in the direction that stretches it: L0_passive = r·|limit − rest| / strain(0.3). Normal ranges bend easily, and hyperextension stays stiff (knee −5°, elbow −10°). On `e3020084…` (deep lunge): right knee 61° → 113°, right hip flexion 17° → 102°, right knee back on its keypoint (13 → 6 px), total S2 energy 47 → 32. Ranges are adult norms; widen them for dancers or other very flexible subjects.
 
 **Floor:** the planted contact points must lie on one plane perpendicular to gravity. Under perspective this is a real depth cue: a foot farther back projects higher. In static mode both feet count as planted when the higher one is within 15 cm; use `--dynamic` for running or jumping.
 
