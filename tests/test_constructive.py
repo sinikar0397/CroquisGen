@@ -1,4 +1,4 @@
-# 인체 도형화 렌더러의 기하 함수 테스트 (카메라/모델 필요 없음)
+# 인체 도형화 렌더러의 geometric function test
 #   python -m pytest tests -q
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from constructive_anatomy.renderer import (  # noqa: E402
-    _BODY_CHAINS,
     _BODY_FOLLOWERS,
+    _BUILDS,
     LENGTH_TOLERANCE,
     _Smoother,
     _correct_proportions,
@@ -29,7 +29,7 @@ def test_overlong_forearm_is_pulled_in_and_hand_follows():
     points[L_WRIST] = (0, 15 + 60)  #4.8H짜리 전완 -> 검출 오류
     points[L_PINKY] = points[L_INDEX] = (0, 80)
 
-    fixed = _correct_proportions(points, _BODY_CHAINS, unit, _BODY_FOLLOWERS)
+    fixed = _correct_proportions(points, _BUILDS['adult']['chains'], unit, _BODY_FOLLOWERS)
 
     forearm = np.linalg.norm(fixed[L_WRIST] - fixed[L_ELBOW])
     assert forearm <= 1.25 * unit * LENGTH_TOLERANCE + 1e-4
@@ -76,3 +76,59 @@ def test_palm_outline_includes_thumb_only_when_it_sticks_out():
     # 손목 모서리 2 + 손가락 4개 x 밑동 2 = 10, 엄지가 나가 있으면 +2
     assert len(folded) == 10
     assert len(spread) == 12
+
+
+def test_cylinder_fill_stays_inside_the_cylinder():
+    # 납작하게 누운 원기둥(squash 0)의 끝 바로 너머에 있는 선은 지워지면 안 된다
+    import cv2
+    from constructive_anatomy.renderer import INK, PAPER, _Scene, _add_cylinder
+    canvas = np.full((100, 100, 3), PAPER, np.uint8)
+    cv2.line(canvas, (56, 20), (56, 80), INK, 1)  #끝(x=50)에서 6px 너머
+    scene = _Scene()
+    _add_cylinder(scene, 0.0, np.array([10.0, 50.0]), np.array([50.0, 50.0]), 10, 10,
+                  squash=0.0, near_is_end=False, thick=1, thin=1)
+    scene.paint(canvas)
+    assert (canvas[50, 56] < 200).any()  #아직 잉크
+
+
+def _world_figure(heads):  #등신 수만큼 키운 3D 모형 (미터). 머리 0.23m 고정, 몸통:다리 = 2.5:3.9
+    from core.landmarks import L_ANKLE, L_EAR, L_HIP, L_KNEE, R_ANKLE, R_EAR, R_HIP, R_KNEE
+    head = 0.23
+    body = (heads - 1.6) * head
+    torso, legs = body * 2.5 / 6.4, body * 3.9 / 6.4
+    w = np.zeros((33, 3), dtype=np.float32)
+    w[L_EAR], w[R_EAR] = (-0.5 * 0.66 * head, 0, 0), (0.5 * 0.66 * head, 0, 0)
+    w[L_SHOULDER], w[12] = (-0.2, 0.2, 0), (0.2, 0.2, 0)
+    w[L_HIP], w[R_HIP] = (-0.1, 0.2 + torso, 0), (0.1, 0.2 + torso, 0)
+    for hip, knee, ankle in ((L_HIP, L_KNEE, L_ANKLE), (R_HIP, R_KNEE, R_ANKLE)):
+        w[knee] = w[hip] + (0, legs / 2, 0)
+        w[ankle] = w[hip] + (0, legs, 0)
+    return w
+
+
+def _full_result(world):
+    from core.types import PerceptionResult
+    return PerceptionResult(width=640, height=480, timestamp_ms=0, pose=np.zeros((33, 3), np.float32),
+                            pose_visibility=np.ones(33, np.float32), pose_world=world)
+
+
+def test_heads_estimate_recovers_the_figure_height():
+    from constructive_anatomy.renderer import _heads_estimate
+    for heads in (6.0, 7.0, 8.0):
+        assert abs(_heads_estimate(_full_result(None), _world_figure(heads)) - heads) < 1e-3
+    assert _heads_estimate(_full_result(None), None) is None  #3D 없으면 판정 안 함
+
+
+def test_build_picker_needs_sustained_evidence_to_switch():
+    from constructive_anatomy.renderer import HEADS_HOLD_FRAMES, _BuildPicker
+    picker = _BuildPicker()  #기본 성인
+    child, adult = _world_figure(6.0), _world_figure(8.0)
+    r = _full_result(None)
+    picker.update(r, child)  #한 프레임으로는 안 바뀜
+    assert picker.name == "adult"
+    for _ in range(HEADS_HOLD_FRAMES + 10):  #EMA가 내려오고 유지 프레임 채우면 바뀜
+        picker.update(r, child)
+    assert picker.name == "child"
+    for _ in range(3):
+        picker.update(r, adult)
+    assert picker.name == "child"  #다시 몇 프레임으로는 안 돌아감

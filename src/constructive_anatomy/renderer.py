@@ -1,6 +1,6 @@
 # 인체 도형화 (Constructive Anatomy) 렌더러 - 3802 김민재
 # 관절 좌표만 가지고 머리/몸통은 타원체, 관절은 구, 팔다리는 원기둥으로 그린다.
-# 학습 모델 없음. 랜드마크 번호는 MediaPipe pose(33점)/hand(21점) 기준.
+# 참고) MediaPipe pose(33 points)/hand(21 points)
 # https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
 from __future__ import annotations
 
@@ -18,28 +18,53 @@ INK = config.INK_COLOR
 PAPER = config.PAPER_COLOR
 GHOST = tuple(int(p * 0.68 + i * 0.32) for p, i in zip(PAPER, INK))  #가려진 선용 연한 잉크
 
-# 비율표. 단위 H = 머리 높이 (8등신 기준)
-TORSO_H = 2.5  #어깨 중심 -> 골반 중심
-SHOULDER_SPAN_H = 1.8
+# 비율표. 단위 H = 머리 높이. 체형(등신)별로 한 벌씩
 LENGTH_TOLERANCE = 1.15  #표준 길이의 이 배수를 넘으면 검출 오류로 봄
+EAR_SPAN_H = 0.66  #귀 사이 폭 / 머리 높이. 3D 좌표에서 머리 높이를 역산할 때 씀
 
-# (관절 번호들), ((길이, 시작 반지름, 끝 반지름), ...)
-_ARM = ((1.5, 0.22, 0.16), (1.25, 0.16, 0.11))
-_LEG = ((2.0, 0.34, 0.21), (1.9, 0.22, 0.13))
-_BODY_CHAINS = (
-    ((L_SHOULDER, L_ELBOW, L_WRIST), _ARM),
-    ((R_SHOULDER, R_ELBOW, R_WRIST), _ARM),
-    ((L_HIP, L_KNEE, L_ANKLE), _LEG),
-    ((R_HIP, R_KNEE, R_ANKLE), _LEG),
-)
-_BODY_FOLLOWERS = {  #관절을 보정하면 같이 따라 움직이는 점들
-    L_WRIST: (L_PINKY, L_INDEX), R_WRIST: (R_PINKY, R_INDEX),
-    L_ANKLE: (L_HEEL, L_FOOT_INDEX), R_ANKLE: (R_HEEL, R_FOOT_INDEX),
-}
-_BODY_JOINTS = {  #관절 구 반지름
+_JOINTS = {  #관절 구 반지름 (성인 기준, 체형별 thickness를 곱함)
     L_SHOULDER: 0.24, R_SHOULDER: 0.24, L_ELBOW: 0.17, R_ELBOW: 0.17,
     L_WRIST: 0.12, R_WRIST: 0.12, L_HIP: 0.28, R_HIP: 0.28,
     L_KNEE: 0.23, R_KNEE: 0.23, L_ANKLE: 0.14, R_ANKLE: 0.14,
+}
+
+
+def _build(torso, shoulder, arm, leg, thickness):
+    # arm/leg = ((길이, 시작 반지름, 끝 반지름), ...). 반지름은 머리 대비라 어릴수록 가늘게
+    def thin(segs):
+        return tuple((L, r0 * thickness, r1 * thickness) for L, r0, r1 in segs)
+    return dict(
+        torso=torso, shoulder=shoulder,  #어깨 중심->골반 중심, 어깨 폭 (H 단위)
+        chains=(
+            ((L_SHOULDER, L_ELBOW, L_WRIST), thin(arm)),
+            ((R_SHOULDER, R_ELBOW, R_WRIST), thin(arm)),
+            ((L_HIP, L_KNEE, L_ANKLE), thin(leg)),
+            ((R_HIP, R_KNEE, R_ANKLE), thin(leg)),
+        ),
+        joints={k: v * thickness for k, v in _JOINTS.items()},
+    )
+
+
+# 등신이 낮을수록 머리가 크고 몸통/팔다리가 짧다. 숫자는 미술 해부학 등신표 기준
+_BUILDS = {
+    "child": _build(1.8, 1.4, ((1.1, 0.22, 0.16), (0.9, 0.16, 0.11)),
+                    ((1.25, 0.34, 0.21), (1.2, 0.22, 0.13)), 0.85),  #6등신
+    "teen": _build(2.2, 1.6, ((1.3, 0.22, 0.16), (1.1, 0.16, 0.11)),
+                   ((1.65, 0.34, 0.21), (1.55, 0.22, 0.13)), 0.93),  #7등신
+    "adult": _build(2.5, 1.8, ((1.5, 0.22, 0.16), (1.25, 0.16, 0.11)),
+                    ((2.0, 0.34, 0.21), (1.9, 0.22, 0.13)), 1.0),  #8등신
+}
+# 측정 등신 경계. 실측은 미술 등신표보다 낮게 나온다: 성인 1명 웹캠 924프레임 중앙값 7.27
+# (p10 7.02, p90 8.11), 계획서 목업 사진 성인 7.3. 그래서 성인 경계를 6.9에 둠
+# shortcut: 성인 1명으로만 보정. 아동/청소년 실측이 생기면 아래 두 값을 다시 잡을 것
+HEADS_CHILD_MAX = 6.3
+HEADS_TEEN_MAX = 6.9
+HEADS_MARGIN = 0.15  #히스테리시스
+HEADS_HOLD_FRAMES = 15  #이만큼 연속으로 다른 구간이어야 바꿈
+
+_BODY_FOLLOWERS = {  #관절을 보정하면 같이 따라 움직이는 점들
+    L_WRIST: (L_PINKY, L_INDEX), R_WRIST: (R_PINKY, R_INDEX),
+    L_ANKLE: (L_HEEL, L_FOOT_INDEX), R_ANKLE: (R_HEEL, R_FOOT_INDEX),
 }
 
 # 손은 단위 P = 손바닥 길이 (손목 -> 중지 MCP)
@@ -74,17 +99,82 @@ class _Smoother:  #프레임 간 지수 스무딩. z가 더 튀어서 z만 alpha
         return self._points
 
 
-def _head_unit(points, result):  #머리 높이(px) 추정
-    # 어깨 폭, 몸통 길이 둘 다 원근으로 줄어들기만 하니까 큰 쪽이 진짜에 가깝다
-    # TODO: 몸통이 양 방향으로 다 줄어드는 자세(카메라 쪽으로 숙임)는 pose_world 길이로 바꿔야 함
+def _dist(arr, a, b):
+    return float(np.linalg.norm(arr[a] - arr[b]))
+
+
+def _mid_dist(arr, a1, a2, b1, b2):  #(a1,a2) 중점과 (b1,b2) 중점 사이 거리
+    return float(np.linalg.norm((arr[a1] + arr[a2]) / 2 - (arr[b1] + arr[b2]) / 2))
+
+
+def _heads_estimate(result, world):
+    # 몇 등신인지 3D(pose_world, 미터)로 잰다. 2D는 숙이기만 해도 줄어들어서 못 씀
+    # 등신 ~= (몸통 + 다리) / 머리높이 + 1.6 (머리+목 1.3, 발목~바닥 0.3)
+    if world is None or not visible(result, L_EAR, R_EAR, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP):
+        return None
+    legs = [_dist(world, h, k) + _dist(world, k, a)
+            for h, k, a in ((L_HIP, L_KNEE, L_ANKLE), (R_HIP, R_KNEE, R_ANKLE))
+            if visible(result, h, k, a)]
+    if not legs:
+        return None
+    head = _dist(world, L_EAR, R_EAR) / EAR_SPAN_H
+    if head < 1e-3:
+        return None
+    torso = _mid_dist(world, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP)
+    return (torso + sum(legs) / len(legs)) / head + 1.6
+
+
+class _BuildPicker:  #등신 측정값으로 체형 프리셋 고르기. 경계에서 떨지 않게 히스테리시스 + 유지 프레임
+    def __init__(self, name="adult"):
+        self.name = name
+        self.heads = None  #스무딩된 측정값 (상태 표시, 디버그용)
+        self._pending = None
+        self._count = 0
+
+    def update(self, result, world):
+        h = _heads_estimate(result, world)
+        if h is None:  #못 재면 지금 체형 유지
+            return _BUILDS[self.name]
+        self.heads = h if self.heads is None else 0.8 * self.heads + 0.2 * h
+        lo, hi = HEADS_CHILD_MAX, HEADS_TEEN_MAX
+        if self.name == "child":
+            lo += HEADS_MARGIN
+        elif self.name == "adult":
+            hi -= HEADS_MARGIN
+        else:
+            lo, hi = lo - HEADS_MARGIN, hi + HEADS_MARGIN
+        want = "child" if self.heads < lo else "adult" if self.heads > hi else "teen"
+        if want == self.name:
+            self._pending, self._count = None, 0
+        elif want == self._pending:
+            self._count += 1
+            if self._count >= HEADS_HOLD_FRAMES:
+                self.name, self._pending, self._count = want, None, 0
+        else:
+            self._pending, self._count = want, 1
+        return _BUILDS[self.name]
+
+
+def _head_unit(points, result, world, build):  #머리 높이(px) 추정
+    # 2D 어깨 폭, 몸통 길이는 원근으로 줄어들기만 하니까 큰 쪽이 진짜에 가깝다
     candidates = [0.0]
-    if visible(result, L_SHOULDER, R_SHOULDER):
-        candidates.append(
-            float(np.linalg.norm(points[L_SHOULDER] - points[R_SHOULDER])) / SHOULDER_SPAN_H)
-        if visible(result, L_HIP, R_HIP):
-            shoulders = (points[L_SHOULDER] + points[R_SHOULDER]) / 2
-            hips = (points[L_HIP] + points[R_HIP]) / 2
-            candidates.append(float(np.linalg.norm(shoulders - hips)) / TORSO_H)
+    if not visible(result, L_SHOULDER, R_SHOULDER):
+        return 0.0
+    hips = visible(result, L_HIP, R_HIP)
+    candidates.append(_dist(points, L_SHOULDER, R_SHOULDER) / build["shoulder"])
+    if hips:
+        candidates.append(_mid_dist(points, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP) / build["torso"])
+    # 3D가 있으면 px/m 스케일로도 추정. 카메라 쪽으로 숙여서 2D가 둘 다 줄어든 자세용
+    if world is not None:
+        scales = [_dist(points, L_SHOULDER, R_SHOULDER) / max(_dist(world, L_SHOULDER, R_SHOULDER), 1e-3)]
+        if hips:
+            scales.append(_mid_dist(points, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP)
+                          / max(_mid_dist(world, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP), 1e-3))
+        # 머리 높이(m)는 프리셋 비율표로 역산. 귀 폭으로 재면 2D 추정과 기준이 달라져서 안 씀
+        head_m = _dist(world, L_SHOULDER, R_SHOULDER) / build["shoulder"]
+        if hips:
+            head_m = max(head_m, _mid_dist(world, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP) / build["torso"])
+        candidates.append(max(scales) * head_m)
     return max(candidates)
 
 
@@ -170,7 +260,7 @@ def _add_cylinder(scene, depth, start, end, r_start, r_end, squash, near_is_end,
     def fill(c):
         cv2.fillConvexPoly(c, quad, PAPER, cv2.LINE_8)
         for centre, r in ((start, r_start), (end, r_end)):
-            cv2.ellipse(c, _pt(centre), _axes(r * squash, r), cap_angle, 0, 360, PAPER, -1, cv2.LINE_8)
+            cv2.ellipse(c, _pt(centre), _axes(r, r * squash), cap_angle, 0, 360, PAPER, -1, cv2.LINE_8)
 
     def stroke(c, ink, ghost):
         for sign in (1, -1):
@@ -292,7 +382,13 @@ class ConstructiveRenderer:
 
     def __init__(self):
         self._pose_filter = _Smoother()
+        self._world_filter = _Smoother(alpha_xy=0.3, alpha_z=0.3)  #3D는 전체적으로 더 튀어서 더 세게
         self._hand_filter = _Smoother()
+        self._picker = _BuildPicker()
+
+    @property
+    def build(self):  #지금 쓰는 체형 이름 (상태 표시, 디버그용)
+        return self._picker.name
 
     def render(self, result: PerceptionResult, target: Target, size: tuple[int, int]) -> np.ndarray:
         canvas = blank_paper(size)
@@ -308,12 +404,15 @@ class ConstructiveRenderer:
         if result.pose is None:
             return
         pose = self._pose_filter.update(result.timestamp_ms, result.pose)
+        world = (self._world_filter.update(result.timestamp_ms, result.pose_world)
+                 if result.pose_world is not None else None)
         points = scaled_points(pose, size)
         depth = pose[:, 2] * size[0]  #z는 x와 같은 스케일이라 width 곱하면 px
-        H = _head_unit(points, result)
+        build = self._picker.update(result, world)
+        H = _head_unit(points, result, world, build)
         if H < 3:
             return
-        points = _correct_proportions(points, _BODY_CHAINS, H, _BODY_FOLLOWERS)
+        points = _correct_proportions(points, build["chains"], H, _BODY_FOLLOWERS)
         thick = max(2, int(round(H * 0.035)))
         thin = max(1, thick // 2)
         seen = lambda *idx: visible(result, *idx)  # noqa: E731
@@ -329,7 +428,7 @@ class ConstructiveRenderer:
 
         self._head(scene, points, depth, result, shoulders, up, H, thick, thin)
 
-        for chain, segments in _BODY_CHAINS:
+        for chain, segments in build["chains"]:
             _add_chain(scene, points, depth, chain, segments, H, thick, thin,
                        rings=1, tips_only=False, ok=seen)
 
@@ -348,7 +447,7 @@ class ConstructiveRenderer:
                 _add_polygon(scene, depth[ankle],
                              np.array([points[ankle], points[heel], points[toe]]), thick)
 
-        for idx, r in _BODY_JOINTS.items():
+        for idx, r in build["joints"].items():
             if seen(idx):
                 _add_sphere(scene, depth[idx], points[idx], r * H, thick)
 
@@ -432,7 +531,7 @@ class ConstructiveRenderer:
         thin = max(1, thick // 2)
 
         palm = _palm_outline(points, P)
-        mid_a, mid_b = (palm[0] + palm[-9]) / 2, (palm[-1] + palm[-2]) / 2  #palm[-9]가 검지 밑동 바깥점
+        mid_a, mid_b = (palm[0] + points[5]) / 2, (palm[-1] + points[17]) / 2  #손목 모서리~검지/소지 MCP 중간
         _add_polygon(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, thick,
                      extra=lambda c, ink, ghost: cv2.line(c, _pt(mid_a), _pt(mid_b), ink, thin,
                                                           cv2.LINE_AA))
