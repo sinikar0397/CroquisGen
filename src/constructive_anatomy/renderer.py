@@ -1,5 +1,6 @@
 # 인체 도형화 (Constructive Anatomy) 렌더러 - 3802 김민재
-# 관절 좌표만 가지고 머리/몸통은 타원체, 관절은 구, 팔다리는 원기둥으로 그린다.
+# AI prompt: rivise a code with reflecting 3D distance (for avoiding shortened leg/arm), 
+# and based on checking the cam, set the criteria for splitting figure(3) and setting freesets.
 # 참고) MediaPipe pose(33 points)/hand(21 points)
 # https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker
 from __future__ import annotations
