@@ -1,12 +1,7 @@
-# 동세 크로키 S1–S3 (photo → 2D keypoints → physically fitted 3D skeleton + spine → static load)
-
-The analysis stages behind the gesture croquis style. `renderer.py` is the live
-renderer registered in `render/registry.py`; everything else here is the offline
-pipeline that feeds it, and it is not bound by the app's 30 ms frame budget.
+# CroquisGen: S1–S4 (photo → 2D keypoints → physically fitted 3D skeleton + spine → static load → gesture strokes)
 
 ```
-src/gesture_croquis/
-  renderer.py      live renderer (render/base.py contract). Currently a geometric placeholder
+croquisgen/
   skeleton.py      canonical 28-joint layout (Halpe-26 order + 2 hand points), bone-length priors, layout converters
   poseframe.py     PoseFrame dataclass = the stage contract, saved as .npz
   s1_keypoints.py  S1: YOLOX person detector + RTMPose (rtmlib). Default Halpe-26 (body + feet)
@@ -17,9 +12,13 @@ src/gesture_croquis/
   muscles.py       S2+S3: unified muscle effort-stress (gravity demand + muscle length, Hill-type)
   spine.py         S2: interpolated 3D spine curve (pelvis → neck → head) from the torso box
   s3_load.py       S3 tier T0: segment masses, ground contacts, reactions, joint/spine torques, stretch proxy
+  s4_gesture.py    S4: line of action, rhythm lines, torso squash/stretch, line weights, novel views, preview
   viz.py           interactive 3D HTML + static PNG (photo overlay, front/side/top)
   run.py           CLI / Pipeline class (models load once; reusable for webcam later)
   synthetic.py     ground-truth lunge pose for tests and --demo
+tests/test_s2_synthetic.py, tests/test_s3_physics.py, tests/test_plausibility.py, tests/test_physical_fit.py, tests/test_occlusion.py,
+tests/test_muscles.py, tests/test_limb_crossing.py, test_s4_gesture.py (in this folder for now; move it to tests/)
+croquis.py         M0 prototype (unchanged; its S4 is superseded by s4_gesture.py, S5 still lives here)
 ```
 
 The S2/S3 test suite (`test_s2_synthetic`, `test_s3_physics`, `test_plausibility`,
@@ -56,6 +55,10 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 | `--no-label-swaps` | off | trust the detector's L/R labels even where limbs overlap |
 | `--no-occlusion` | off | ignore body-part contours (front/behind order) |
 | `--workers` | #cores (≤8) | parallel fit processes |
+| `--no-s4` | off | skip the gesture strokes |
+| `--views` | `0` | S4 views, `yaw[:pitch]` list in degrees: `0,90,-45:20` (0 = photo camera) |
+| `--layers` | `AB` | S4 layers: A line of action, B gesture/rhythm, C construction volumes |
+| `--exaggeration` | `0.35` | how far the line of action is pushed off its chord (0.2–0.5) |
 | `--device` | `auto` | `mps` = CoreML EP; falls back to CPU automatically if CoreML rejects the model |
 
 ## How S2 works
@@ -190,6 +193,63 @@ Synthetic checks (`test_s3_physics.py`, not yet brought over):
 - leaning 35° forward raises the L5 torque more than 3×;
 - the floating front foot of the lunge gets planted for balance and both legs carry load;
 - a side bend curves the spine toward the stretched side.
+
+## S4: abstraction (`s4_gesture.py`)
+`build_croquis(frame, View(yaw, pitch), layers="AB", exaggeration=0.35) -> Croquis`. It runs in about 30–60 ms per view.
+
+Nothing in S4 moves a joint. Every stroke comes from the projected S2 skeleton and spine. The only freedoms are which chain to draw, a cubic-Bézier simplification, a bounded bow, and the line weight.
+
+Output: `<stem>_croquis[<view>].json` holds the strokes in view pixels with per-sample width, depth and layer, plus the line-of-action (LOA) candidate table. `<stem>_croquis[<view>].png` is a preview panel: the strokes over the faded photo, next to the clean drawing.
+
+**Views.** Yaw and pitch rotate the body about the vertical and horizontal axes through the pelvis, then reuse the photo camera at the same distance. The photo view (0) is in the photo's pixel frame, so strokes overlay it directly. Without S2, S4 falls back to the 2D keypoints: photo view only, no depth cues.
+
+**Line of action (layer A).**
+1. Candidate chains:
+   - head → spine → either leg;
+   - either hand → arm → spine → the opposite leg or the same-side leg;
+   - spine only.
+
+   Chains use the S2 **spine curve**, not the neck–pelvis line, and leave it at L1 for the hip. Going through the pelvis centre would add a sideways jog that reads as a false S.
+2. Every chain is resampled by 2D arc length and fitted with one cubic Bézier: fixed ends, chord-length start, then nearest-point and Newton re-parameterisation.
+3. Score = (L / body px) · (1 + load) · (1 + 0.6·support) / (1 + 25·fit residual) / (1 + 10·backtrack).
+   - load is the mean S3 effort along the chain;
+   - support is the fraction of body weight on the chain's leg;
+   - backtrack is the share of the path that runs back along its own chord. A hanging arm folds onto the trunk and is rejected this way; a C or S curve never doubles back.
+4. The winner is **exaggerated**: its inner control points are pushed off the chord by (1 + k), and the end points stay on the skeleton. It is classified as a C or S curve from the sign changes of its turning.
+
+**Rhythm lines (layer B).** One cubic per limb (shoulder→elbow→wrist→hand, hip→knee→ankle), plus a small wedge per foot (heel→ball).
+- The limb's own bend is exaggerated by half of k.
+- A **muscle-side bias** bows the line toward the working or shortened muscles. Per S3 group, q = activation + 0.5·shortening. Directions come from the limb's anatomical frame: the trunk's forward and lateral axes, carried by the minimal rotation from "hanging" to the limb's chord. Examples: flexors anterior, hip abductors lateral.
+- A limb whose muscles are passively stretched is straightened (×(1 − 0.8·min(1, 2·passive))). This is the artist's "straight = stretched, curved = working" rule.
+- Limbs that are part of the LOA are drawn as light ghosts.
+
+**Torso.** The two contour lines are the torso's **silhouette sides for this view**, on an elliptic cross-section: left/right in a frontal view, front/back in profile, blended in between.
+- Squash per side comes from the side lengths (lateral) and from the abdominals vs back-extensor lengths (sagittal).
+- The squashed side is a heavy curve, bowed inward along the spine's concavity. The stretched side is a light, straight line.
+- Shoulder and hip lines record their tilt; opposite tilts are flagged as contrapposto. A tilt is not reported when the line points into the view.
+- The head is an ellipse sized from body height (stable in any view), with a tick toward the nose when the face is turned.
+
+**Construction (layer C).** Ribcage and pelvis ellipses and joint circles. They are 2D approximations, fine as a mannequin hint.
+
+**Line weight** per sample, as in the plan:
+`w = w0[role]·S·(1 + 0.8·effort + 0.6·compression + 0.5·near + 0.5·support)·taper(t)·(1 + 0.6·front)·(1 − 0.8·behind)`
+- S is the torso length in px / 120. The weight factor is Gaussian-smoothed along each stroke, so a line swells once and doesn't bulge at every joint.
+- **front / behind:** where two layer-B strokes cross (excluding end-to-end touches and strokes of the same group), the one more than 3 cm nearer gets an accent and the farther one thins to a "lost line". This is the overlap/T-junction cue. The LOA is abstract and takes no part.
+- All weights are in `S4Params`.
+
+**Preview.** `render_preview` and `preview_panel` draw quads with round joins at 2× supersampling. This is a stand-in for S5 (skia/pycairo, SVG per layer), which can consume the JSON strokes as they are.
+
+**Not yet:** the learned stroke stylisation, velocity/follow-through cues for airborne poses (`info.airborne` and `com_offset_m` are passed through for that), and a sagittal torso squash beyond what the muscle lengths give.
+
+Tests (`test_s4_gesture.py`, synthetic poses):
+- the Bézier fit;
+- a neutral stance picks head→leg, not a folded arm;
+- the LOA is the heaviest stroke and its ends stay on the skeleton;
+- a left side-bend squashes the left torso side;
+- a single-support leg is heavier;
+- yaw 360 equals the photo view, and novel views are finite;
+- overlap thins the stroke behind;
+- the 2D fallback, layer selection, JSON and the renderer.
 
 ## Known limits / next steps
 * **Speed:** S1 should be real-time-capable. S2 currently takes about 250–600 ms per fit (finite-difference Jacobian); `auto` z-sign × two starts means 4 fits. For webcam use: warm-start from the previous frame, fix the sign, write an analytic Jacobian, and re-detect the bbox every N frames only.

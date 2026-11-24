@@ -7,8 +7,11 @@ CroquisGen S1+S2 runner: image -> RTMPose 2D keypoints -> 3D skeleton -> visuali
     python -m croquisgen.run --demo                                 # synthetic pose, no models
     python -m croquisgen.run --image sit.jpg --contacts lheel,rheel,pelvis   # seated: override contacts
 
-Stages: S1 RTMPose 2D -> S2 3D skeleton + spine curve -> S3 static load (T0).
+    python -m croquisgen.run --image photo.jpg --views 0,90,-45:20 --layers ABC   # S4 extra views
+
+Stages: S1 RTMPose 2D -> S2 3D skeleton + spine curve -> S3 static load (T0) -> S4 gesture strokes.
 Outputs per image in --out:  <stem>.npz (PoseFrame)  <stem>_3d.html (interactive)  <stem>_views.png
+                             <stem>_croquis[_y<yaw>_p<pitch>].png / .json (S4 strokes per view)
 """
 from __future__ import annotations
 import argparse
@@ -23,6 +26,7 @@ from .poseframe import PoseFrame
 from .s2_lift import Lifter3D, default_K, exif_focal_35mm, fit_skeleton, init_from_depth, project
 from .skeleton import IDX, J
 from .s3_load import static_load
+from .s4_gesture import build_croquis, View, preview_panel, summary as summary_s4
 from . import viz
 
 IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -61,14 +65,32 @@ class Pipeline:
         return f
 
 
-def write_outputs(frame, img, out_dir, stem, title):
+def write_outputs(frame, img, out_dir, stem, title, s4=None):
     os.makedirs(out_dir, exist_ok=True)
     frame.save(os.path.join(out_dir, f"{stem}.npz"))
     viz.make_html(frame, img, os.path.join(out_dir, f"{stem}_3d.html"), title=title)
     viz.make_png(frame, img, os.path.join(out_dir, f"{stem}_views.png"))
+    if s4 is not None:
+        write_croquis(frame, img, out_dir, stem, **s4)
 
 
-def run_demo(out_dir, height, s3_kw=None):
+def write_croquis(frame, img, out_dir, stem, views=("0",), layers="AB", exaggeration=0.35):
+    """S4 for each requested view: <stem>_croquis<tag>.json (strokes) + .png (preview panel)."""
+    out = []
+    for v in views:
+        view = View.parse(v) if not isinstance(v, View) else v
+        if frame.joints3d is None and not view.is_photo:
+            continue
+        c = build_croquis(frame, view, layers=layers, exaggeration=exaggeration)
+        base = os.path.join(out_dir, f"{stem}_croquis{view.tag}")
+        c.save(base + ".json")
+        cv2.imwrite(base + ".png", preview_panel(c, img))
+        print(summary_s4(c))
+        out.append(c)
+    return out
+
+
+def run_demo(out_dir, height, s3_kw=None, s4_kw=None):
     """Synthetic lunge rendered as a stick-figure 'photo'; simulated depth cue. Tests S2 + viz only."""
     from .synthetic import lunge_pose
     hw = (960, 1280)
@@ -88,7 +110,8 @@ def run_demo(out_dir, height, s3_kw=None):
     if s3_kw is not None:
         static_load(f, **s3_kw)
         print(summary_s3(f))
-    write_outputs(f, img, out_dir, "demo", "CroquisGen S1+S2 · synthetic demo")
+    write_outputs(f, img, out_dir, "demo", "CroquisGen S1+S2 · synthetic demo",
+                  s4=s4_kw if f.s3_info else None)
     print(json.dumps({k: v for k, v in info.items() if k != "hinge"}, indent=1, default=float))
 
 
@@ -132,13 +155,21 @@ def main():
     ap.add_argument("--workers", type=int, default=None, help="parallel fit processes (default: #cores, max 8)")
     ap.add_argument("--dynamic", action="store_true",
                     help="running/jumping/falling: disable the static-balance prior in the 3D fit")
+    ap.add_argument("--no-s4", action="store_true", help="skip the S4 gesture strokes")
+    ap.add_argument("--views", default="0",
+                    help="S4 views, comma list of yaw[:pitch] degrees, e.g. 0,90,-45:20 (0 = photo camera)")
+    ap.add_argument("--layers", default="AB",
+                    help="S4 layers: A line of action, B gesture/rhythm, C construction volumes")
+    ap.add_argument("--exaggeration", type=float, default=0.35, help="S4 line-of-action push (0.2-0.5)")
     ap.add_argument("--demo", action="store_true")
     a = ap.parse_args()
 
     contacts = a.contacts.split(",") if a.contacts else None
     s3_kw = None if a.no_s3 else dict(body_mass=a.mass, contacts=contacts, sagittal=a.sagittal)
+    s4_kw = None if a.no_s4 else dict(views=[v for v in a.views.split(",") if v.strip()], layers=a.layers,
+                                      exaggeration=a.exaggeration)
     if a.demo:
-        return run_demo(a.out, a.height, s3_kw)
+        return run_demo(a.out, a.height, s3_kw, s4_kw)
     paths = [a.image] if a.image else sorted(str(p) for p in Path(a.images).iterdir()
                                              if p.suffix.lower() in IMG_EXT)
     pipe = Pipeline(a.s1, a.mode, a.s2, a.height, a.device, a.z_sign, s3=not a.no_s3,
@@ -172,6 +203,8 @@ def main():
                 print("  ! two readings are almost equally good: check the side view")
         if f.s3_info:
             print(summary_s3(f))
+        if s4_kw is not None:
+            write_croquis(f, img, a.out, stem, **s4_kw)
     print(f"outputs in {os.path.abspath(a.out)}")
 
 
