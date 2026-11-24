@@ -65,26 +65,56 @@ class Pipeline:
         return f
 
 
-def write_outputs(frame, img, out_dir, stem, title, s4=None):
+class Timer:
+    """Named wall-clock laps in ms:  with T("s4"): ...  ->  T.ms["s4"]"""
+
+    def __init__(self):
+        self.ms = {}
+
+    def __call__(self, key):
+        timer = self
+
+        class _Lap:
+            def __enter__(self):
+                self.t = time.perf_counter()
+
+            def __exit__(self, *exc):
+                timer.ms[key] = timer.ms.get(key, 0.0) + 1e3 * (time.perf_counter() - self.t)
+        return _Lap()
+
+
+def write_outputs(frame, img, out_dir, stem, title, s4=None, timer=None):
+    T = timer or Timer()
     os.makedirs(out_dir, exist_ok=True)
-    frame.save(os.path.join(out_dir, f"{stem}.npz"))
-    viz.make_html(frame, img, os.path.join(out_dir, f"{stem}_3d.html"), title=title)
-    viz.make_png(frame, img, os.path.join(out_dir, f"{stem}_views.png"))
+    with T("out_npz"):
+        frame.save(os.path.join(out_dir, f"{stem}.npz"))
+    with T("out_html"):
+        viz.make_html(frame, img, os.path.join(out_dir, f"{stem}_3d.html"), title=title)
+    with T("out_views_png"):
+        viz.make_png(frame, img, os.path.join(out_dir, f"{stem}_views.png"))
     if s4 is not None:
-        write_croquis(frame, img, out_dir, stem, **s4)
+        write_croquis(frame, img, out_dir, stem, timer=T, **s4)
+    return T
 
 
-def write_croquis(frame, img, out_dir, stem, views=("0",), layers="AB", exaggeration=0.35):
+def write_croquis(frame, img, out_dir, stem, views=("0",), layers="AB", exaggeration=0.35, timer=None):
     """S4 for each requested view: <stem>_croquis<tag>.json (strokes) + .png (preview panel)."""
+    T = timer or Timer()
     out = []
     for v in views:
         view = View.parse(v) if not isinstance(v, View) else v
         if frame.joints3d is None and not view.is_photo:
             continue
-        c = build_croquis(frame, view, layers=layers, exaggeration=exaggeration)
+        with T("s4_build"):
+            c = build_croquis(frame, view, layers=layers, exaggeration=exaggeration)
+        for k, v_ in c.info["timings_ms"].items():          # S4 internal steps, summed over views
+            if k != "total":
+                T.ms["s4." + k] = T.ms.get("s4." + k, 0.0) + v_
         base = os.path.join(out_dir, f"{stem}_croquis{view.tag}")
-        c.save(base + ".json")
-        cv2.imwrite(base + ".png", preview_panel(c, img))
+        with T("s4_json"):
+            c.save(base + ".json")
+        with T("s4_preview_png"):
+            cv2.imwrite(base + ".png", preview_panel(c, img))
         print(summary_s4(c))
         out.append(c)
     return out
@@ -108,11 +138,32 @@ def run_demo(out_dir, height, s3_kw=None, s4_kw=None):
     f.joints3d, f.valid3d, f.camera_K, f.s2_info, f.s2_backend = Xh, v, K, info, "demo (simulated depth)"
     f.body_height_m = height
     if s3_kw is not None:
+        t = time.perf_counter()
         static_load(f, **s3_kw)
+        f.s3_info["s3_ms"] = 1e3 * (time.perf_counter() - t)
         print(summary_s3(f))
-    write_outputs(f, img, out_dir, "demo", "CroquisGen S1+S2 · synthetic demo",
-                  s4=s4_kw if f.s3_info else None)
+    t = time.perf_counter()
+    T = write_outputs(f, img, out_dir, "demo", "CroquisGen S1+S2 · synthetic demo",
+                      s4=s4_kw if f.s3_info else None)
+    print(timing_report(f, T, 1e3 * (time.perf_counter() - t) + f.s3_info.get("s3_ms", 0.0)))
     print(json.dumps({k: v for k, v in info.items() if k != "hinge"}, indent=1, default=float))
+
+
+def timing_report(f, T, total_ms):
+    """One table per image: every stage, its share of the total, slowest first."""
+    i = f.s2_info or {}
+    ms = {"s1_detect": i.get("s1_det_ms"), "s1_pose": i.get("s1_pose_ms"), "s2_lift": i.get("s2_total_ms"),
+          "s3_load": (f.s3_info or {}).get("s3_ms")}
+    ms = {k: v for k, v in ms.items() if v is not None}
+    ms.update({k: v for k, v in T.ms.items()})
+    top = {k: v for k, v in ms.items() if not k.startswith("s4.")}
+    lines = ["  timing (ms, slowest first; total %.0f):" % total_ms]
+    for k, v in sorted(top.items(), key=lambda kv: -kv[1]):
+        lines.append("    %-16s %8.1f  %5.1f%%  %s" % (k, v, 100 * v / max(total_ms, 1e-9), "#" * int(40 * v / max(total_ms, 1e-9))))
+    sub = {k[3:]: v for k, v in ms.items() if k.startswith("s4.")}
+    if sub:
+        lines.append("    s4_build split: " + ", ".join("%s %.1f" % kv for kv in sorted(sub.items(), key=lambda kv: -kv[1])))
+    return "\n".join(lines)
 
 
 def summary_s3(f):
@@ -161,6 +212,8 @@ def main():
     ap.add_argument("--layers", default="AB",
                     help="S4 layers: A line of action, B gesture/rhythm, C construction volumes")
     ap.add_argument("--exaggeration", type=float, default=0.35, help="S4 line-of-action push (0.2-0.5)")
+    ap.add_argument("--profile", action="store_true",
+                    help="cProfile each image: print the 25 slowest functions, save <out>/<stem>.prof")
     ap.add_argument("--demo", action="store_true")
     a = ap.parse_args()
 
@@ -172,18 +225,27 @@ def main():
         return run_demo(a.out, a.height, s3_kw, s4_kw)
     paths = [a.image] if a.image else sorted(str(p) for p in Path(a.images).iterdir()
                                              if p.suffix.lower() in IMG_EXT)
+    t_init = time.perf_counter()
     pipe = Pipeline(a.s1, a.mode, a.s2, a.height, a.device, a.z_sign, s3=not a.no_s3,
                     mass=a.mass, contacts=contacts, sagittal=a.sagittal, dynamic=a.dynamic,
                     search=not a.no_search, physical=not a.no_physical,
                     label_swaps=not a.no_label_swaps, workers=a.workers, occlusion=not a.no_occlusion)
+    print(f"[init] total {1e3 * (time.perf_counter() - t_init):.0f} ms (model loading, not counted per image)")
     for p in paths:
-        img = cv2.imread(p)
+        t_img = time.perf_counter()
+        T = Timer()
+        prof = None
+        if a.profile:
+            import cProfile
+            prof = cProfile.Profile(); prof.enable()
+        with T("read_image"):
+            img = cv2.imread(p)
         if img is None:
             print(f"skip {p}: unreadable"); continue
         K = default_K(img.shape[:2], fov_deg=a.fov, focal_35mm=exif_focal_35mm(p))
         f = pipe(img, K=K)
         stem = Path(p).stem
-        write_outputs(f, img, a.out, stem, f"CroquisGen S1+S2 · {Path(p).name}")
+        write_outputs(f, img, a.out, stem, f"CroquisGen S1+S2 · {Path(p).name}", timer=T)
         i = f.s2_info
         print(f"{Path(p).name}: people {i['n_people']} | S1 det {i['s1_det_ms']:.0f} ms + pose "
               f"{i['s1_pose_ms']:.0f} ms | S2 {i['s2_total_ms']:.0f} ms | reproj {i['reproj_px_median']:.1f}px "
@@ -204,7 +266,15 @@ def main():
         if f.s3_info:
             print(summary_s3(f))
         if s4_kw is not None:
-            write_croquis(f, img, a.out, stem, **s4_kw)
+            write_croquis(f, img, a.out, stem, timer=T, **s4_kw)
+        print(timing_report(f, T, 1e3 * (time.perf_counter() - t_img)))
+        if prof is not None:
+            import pstats
+            prof.disable()
+            os.makedirs(a.out, exist_ok=True)
+            prof.dump_stats(os.path.join(a.out, f"{stem}.prof"))
+            print("  cProfile (cumulative, top 25; open the .prof with `snakeviz` for a flame view):")
+            pstats.Stats(prof).sort_stats("cumulative").print_stats(25)
     print(f"outputs in {os.path.abspath(a.out)}")
 
 

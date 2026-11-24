@@ -33,6 +33,7 @@ Line weight per stroke sample (px):
 from __future__ import annotations
 from dataclasses import dataclass, field, asdict
 import json
+import time
 import numpy as np
 
 from .skeleton import IDX
@@ -822,22 +823,30 @@ def build_croquis(frame, view: View | None = None, params: S4Params | None = Non
     prm = params or S4Params()
     if exaggeration is not None:
         prm.exaggeration = float(exaggeration)
-    b = BodyView(frame, view)
+    tm, t0 = {}, time.perf_counter()
+
+    def lap(k):
+        nonlocal t0
+        t = time.perf_counter(); tm[k] = round(1e3 * (t - t0), 2); t0 = t
+
+    b = BodyView(frame, view); lap("view")
     S = b.unit()
-    loa, loa_info = line_of_action(b, prm)
+    loa, loa_info = line_of_action(b, prm); lap("loa")
     strokes = [loa]
-    limbs = rhythm_lines(b, prm, set(loa_info["joints"]))
-    torso, torso_info = torso_lines(b, prm)
-    strokes += torso + limbs + head_strokes(b)
+    limbs = rhythm_lines(b, prm, set(loa_info["joints"])); lap("limbs")
+    torso, torso_info = torso_lines(b, prm); lap("torso")
+    strokes += torso + limbs + head_strokes(b); lap("head")
     if "C" in layers:
         strokes += construction(b)
+    lap("construction")
     strokes = [s for s in strokes if s.layer in layers]
-    assign_weights(strokes, b, prm, S)
+    assign_weights(strokes, b, prm, S); lap("weights")
+    tm["total"] = round(sum(tm.values()), 2)
     s3 = frame.s3_info or {}
     info = dict(mode=b.mode, unit_px=round(S, 3), support={k: round(v, 3) for k, v in b.support.items()},
                 com_offset_m=s3.get("com_offset_m"), balanced=s3.get("balanced"),
                 airborne=not bool(frame.contacts) if b.mode == "3d" else None,
-                torso=torso_info, layers=layers, exaggeration=prm.exaggeration,
+                torso=torso_info, layers=layers, timings_ms=tm, exaggeration=prm.exaggeration,
                 overlaps={s.name: dict(front=round(float(s.front.mean()), 2), behind=round(float(s.behind.mean()), 2))
                           for s in strokes if s.front is not None and (s.front.any() or s.behind.any())})
     return Croquis(tuple(frame.img_hw), view, float(S), strokes, loa_info, info)
