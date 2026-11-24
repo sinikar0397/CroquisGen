@@ -255,9 +255,92 @@ def _combos(group):
         yield mask, [e for m, b in zip(mask, bits) if m for e in b]
 
 
+_TREE_IDX = np.array([(IDX[a], IDX[b]) for a, b in _TREE])
+_EDGE_POS = {e: k for k, e in enumerate(_TREE)}
+
+
+def flip_edges_batch(Xb, K, flipmask):
+    """flip_edges for a batch: Xb (B,J,3), flipmask (B, len(_TREE)) bool. Rows with no flip are
+    returned unchanged (as flip_edges does)."""
+    Xb = np.asarray(Xb, float)
+    flipmask = np.asarray(flipmask, bool)
+    z = np.maximum(Xb[..., 2], 1e-3)
+    uv = Xb[..., :2] / z[..., None] * K[[0, 1], [0, 1]] + K[:2, 2]
+    rays = np.concatenate([(uv - K[:2, 2]) / K[[0, 1], [0, 1]], np.ones(Xb.shape[:2] + (1,))], -1)
+
+    def roots(r, P, L):
+        A, B, C = (r * r).sum(-1), -2 * (r * P).sum(-1), (P * P).sum(-1) - L * L
+        disc = np.sqrt(np.maximum(B * B - 4 * A * C, 0.0))
+        return (-B - disc) / (2 * A), (-B + disc) / (2 * A)
+
+    Xn = Xb.copy()
+    for k, (ia, ib) in enumerate(_TREE_IDX):
+        L = np.linalg.norm(Xb[:, ib] - Xb[:, ia], axis=-1)
+        r = rays[:, ib]
+        near, far = roots(r, Xb[:, ia], L)
+        on_far = np.abs(Xb[:, ib, 2] - far) < np.abs(Xb[:, ib, 2] - near)
+        on_far ^= flipmask[:, k]
+        near, far = roots(r, Xn[:, ia], L)
+        Xn[:, ib] = np.maximum(np.where(on_far, far, near), 0.3)[:, None] * r
+    none = ~flipmask.any(1)
+    Xn[none] = Xb[none]
+    return Xn
+
+
+def _mask_of(edges):
+    m = np.zeros(len(_TREE), bool)
+    for e in edges:
+        m[_EDGE_POS[e]] = True
+    return m
+
+
 def search_flips(X, K, scorer, sweeps=2, depth_scale=1.0):
     """For each torso configuration, coordinate-descend over limb flips.
-    Returns a list of (score, X, flips_description) sorted best first (one per torso config)."""
+    Returns a list of (score, X, flips_description) sorted best first (one per torso config).
+    With JAX the 8 independent descents run in lockstep and every step's candidates are scored in
+    one batched call (same algorithm and result, ~15 calls instead of ~250)."""
+    from . import s2_jax
+    if s2_jax.available():
+        return _search_flips_batched(X, K, scorer, sweeps, depth_scale)
+    return _search_flips_serial(X, K, scorer, sweeps, depth_scale)
+
+
+def _search_flips_batched(X, K, scorer, sweeps=2, depth_scale=1.0):
+    from .s2_jax import scorer_spec, score_batch
+    spec = scorer_spec(scorer, depth_scale)
+    torso = list(_combos("torso"))
+    n = len(torso)
+    Xc = flip_edges_batch(np.repeat(X[None], n, 0), K, np.stack([_mask_of(e) for _, e in torso]))
+    cur = score_batch(Xc, spec)
+    chosen = [{"torso": m} for m, _ in torso]
+    active = np.ones(n, bool)
+    for _ in range(sweeps):
+        improved = np.zeros(n, bool)
+        for g in LIMB_GROUPS:
+            cands = [(m, _mask_of(e)) for m, e in _combos(g) if any(m)]
+            idx = np.where(active)[0]
+            if not len(idx):
+                break
+            Xb = np.repeat(Xc[idx], len(cands), 0)
+            fm = np.tile(np.stack([c[1] for c in cands]), (len(idx), 1))
+            Xb = flip_edges_batch(Xb, K, fm)
+            sc = score_batch(Xb, spec).reshape(len(idx), len(cands))
+            for a, i in enumerate(idx):
+                c = int(np.argmin(sc[a]))                   # first minimum = serial tie-breaking
+                if sc[a, c] < cur[i] - 1e-6:
+                    cur[i], Xc[i] = sc[a, c], Xb[a * len(cands) + c]
+                    prev = chosen[i].get(g, (0,) * len(GROUPS[g]))
+                    chosen[i][g] = tuple(int(p ^ m) for p, m in zip(prev, cands[c][0]))
+                    improved[i] = True
+        active &= improved
+        if not active.any():
+            break
+    results = [(float(cur[i]), Xc[i].copy(), {g: m for g, m in chosen[i].items() if any(m)}) for i in range(n)]
+    results.sort(key=lambda r: r[0])
+    return results
+
+
+def _search_flips_serial(X, K, scorer, sweeps=2, depth_scale=1.0):
     results = []
     for tmask, tedges in _combos("torso"):
         Xc = flip_edges(X, K, tedges)

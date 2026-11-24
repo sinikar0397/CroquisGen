@@ -527,7 +527,110 @@ def row_mask(spec):
     return m
 
 
+# ============================================================================ batched plausibility score
+SCORE_BATCH = 32
+
+
+def _score_one(X, s):
+    """plausibility.Scorer.terms(X)["total"] without effort, for one pose (vmapped below)."""
+    vm = s["vmask"]
+    rp = (_project(X, s["K"]) - s["k2"]) / s["sig_px"]
+    em = s["emask"]
+    E = s["E"]
+    L = _norm(X[E[:, 0]] - X[E[:, 1]]) * em
+    Lr = s["Lref"]
+    k = (L @ Lr) / (L @ L + 1e-12)
+    image = jnp.sum(s["conf"] * vm * jnp.sum(rp * rp, 1)) + jnp.sum(em * ((k * L - Lr) / (0.05 * jnp.where(em > 0, Lr, 1.0))) ** 2)
+    r = ((X[E[:, 1], 2] - X[E[:, 0], 2]) - s["ds"] * s["ezr"]) / 0.07
+    depth = s["use_depth"] * jnp.sum(em * s["ew"] ** 2 * jnp.log1p(r * r))
+    limits = jnp.sum(pose_prior_terms(X) ** 2)
+    twist = jnp.sum(twist_terms(X) ** 2)
+    qa, pa0 = X[_PA[:, 1]], X[_PA[:, 0]]
+    pa = qa + (pa0 - qa) * _PF[:, None]
+    pen = _PR * (s["height"] / 1.70) - _seg_dist(pa, qa, X[_PB[:, 0]], X[_PB[:, 1]])
+    pen = jnp.maximum(jnp.where(s["coll_ok"], pen, -1.0), 0.0)
+    collision = jnp.sum((pen / 0.03) ** 2)
+    balance = (2 * balance_term(X)) ** 2
+    occl = jnp.sum(order_terms(X, s) ** 2)
+    W = s["W"]                                   # image, depth, limits, twist, collision, balance, occlusion
+    return (W[0] * image + W[1] * depth + W[2] * limits + W[3] * twist + W[4] * collision
+            + W[5] * balance + W[6] * occl)
+
+
+_SCORE = None
+
+
+def scorer_spec(sc, depth_scale=1.0):
+    """Fixed-shape arrays for a plausibility.Scorer (all tree edges, masked)."""
+    from .s2_lift import _TREE
+    Et = np.array([(IDX[a], IDX[b]) for a, b in _TREE], np.int32)
+    pos = {(int(a), int(b)): k for k, (a, b) in enumerate(Et)}
+    em, Lr, ew, ezr = np.zeros(len(Et)), np.ones(len(Et)), np.zeros(len(Et)), np.zeros(len(Et))
+    for n, (a, b) in enumerate(sc.E):
+        k = pos[(int(a), int(b))]
+        em[k], Lr[k] = 1.0, sc.Lref[n]
+        if sc.z_rel is not None:
+            ew[k], ezr[k] = sc.ew[n], sc.ezr[n]
+    v = np.zeros(J); v[sc.vi] = 1.0
+    W = sc.W
+    s = dict(K=np.asarray(sc.K, float), k2=np.asarray(sc.k2, float), conf=np.asarray(sc.conf, float), vmask=v,
+             sig_px=np.float64(sc.sig_px), E=Et, emask=em, Lref=Lr, ew=ew, ezr=ezr,
+             use_depth=np.float64(sc.z_rel is not None), ds=np.float64(depth_scale), height=np.float64(sc.height),
+             coll_ok=sc.valid[_PA].all(1) & sc.valid[_PB].all(1),
+             W=np.array([W["image"], W["depth"], W["limits"], W["twist"], W["collision"], W["balance"],
+                         W["occlusion"] if sc.order_cons else 0.0], float))
+    s.update(occlusion_arrays(sc.order_cons))
+    return {k: jnp.asarray(val) for k, val in s.items()}
+
+
+def score_batch(Xb, spec):
+    """Totals for a batch of poses (B,J,3); padded to SCORE_BATCH so one compilation serves all."""
+    global _SCORE
+    if _SCORE is None:
+        _SCORE = jax.jit(jax.vmap(_score_one, in_axes=(0, None)))
+    Xb = np.asarray(Xb, float)
+    out = []
+    for i in range(0, len(Xb), SCORE_BATCH):
+        chunk = Xb[i:i + SCORE_BATCH]
+        pad = SCORE_BATCH - len(chunk)
+        if pad:
+            chunk = np.concatenate([chunk, np.repeat(chunk[-1:], pad, 0)])
+        out.append(np.asarray(_SCORE(chunk, spec))[:SCORE_BATCH - pad])
+    return np.concatenate(out)
+
+
 # ============================================================================ spec from fit_skeleton
+def occlusion_arrays(order_cons):
+    """Occlusion order constraints as fixed-size padded arrays (see occlusion.order_terms)."""
+    oa, ob, ot, okind, ow, om = (np.zeros(MAX_SEG_PTS, np.int32), np.zeros(MAX_SEG_PTS, np.int32),
+                                 np.zeros(MAX_SEG_PTS), np.zeros(MAX_SEG_PTS), np.zeros(MAX_SEG_PTS),
+                                 np.zeros(MAX_SEG_PTS))
+    pa_ = {k: np.zeros(MAX_PAIRS, np.int32) for k in ("pfa", "pfb", "pba", "pbb")}
+    pf_ = {k: np.zeros(MAX_PAIRS) for k in ("ptf", "ptb", "pweight", "pmargin", "pm")}
+    oa[:] = ob[:] = IDX["pelvis"]
+    for k in pa_:
+        pa_[k][:] = IDX["pelvis"]
+    n = q = 0
+    for c in (order_cons or []):
+        if c["kind"] == "pair":
+            if q >= MAX_PAIRS:
+                raise ValueError("too many occlusion pair constraints for s2_jax")
+            pa_["pfa"][q], pa_["pfb"][q], pa_["pba"][q], pa_["pbb"][q] = c["fa"], c["fb"], c["ba"], c["bb"]
+            pf_["ptf"][q], pf_["ptb"][q], pf_["pweight"][q], pf_["pmargin"][q], pf_["pm"][q] = (
+                c["tf"], c["tb"], c["weight"], c["margin"], 1.0)
+            q += 1
+        else:
+            ts = np.asarray(c["ts"], float)
+            if n + len(ts) > MAX_SEG_PTS:
+                raise ValueError("too many occlusion sample points for s2_jax")
+            sl = slice(n, n + len(ts))
+            oa[sl], ob[sl], ot[sl] = c["a"], c["b"], ts
+            okind[sl] = 1.0 if c["kind"] == "behind" else -1.0
+            ow[sl], om[sl] = c["weight"], 1.0
+            n += len(ts)
+    return dict(oa=oa, ob=ob, ot=ot, okind=okind, ow=ow, om=om, **pa_, **pf_)
+
+
 def build_spec(kpts2d, conf, K, height, valid, park, sig_px, use_depth, E=None, ew=None, ezr=None,
                w_hinge=1.0, w_depth=1.0, w_prior=1.0, height_sigma=0.07, prop_sigma=0.10,
                w_balance=1.0, physics=None, order_cons=None, w_order=1.0, hinge_ok=None):
@@ -559,34 +662,7 @@ def build_spec(kpts2d, conf, K, height, valid, park, sig_px, use_depth, E=None, 
             k = key[(int(a), int(b))]
             ewf[k], ezf[k] = w_, z_
     s.update(E=Et, ew=f8(ewf), ezr=f8(ezf))
-    # occlusion constraints (padded)
-    oa, ob, ot, okind, ow, om = (np.zeros(MAX_SEG_PTS, np.int32), np.zeros(MAX_SEG_PTS, np.int32),
-                                 np.zeros(MAX_SEG_PTS), np.zeros(MAX_SEG_PTS), np.zeros(MAX_SEG_PTS),
-                                 np.zeros(MAX_SEG_PTS))
-    pa_ = {k: np.zeros(MAX_PAIRS, np.int32) for k in ("pfa", "pfb", "pba", "pbb")}
-    pf_ = {k: np.zeros(MAX_PAIRS) for k in ("ptf", "ptb", "pweight", "pmargin", "pm")}
-    oa[:] = ob[:] = IDX["pelvis"]
-    for k in pa_:
-        pa_[k][:] = IDX["pelvis"]
-    n = q = 0
-    for c in (order_cons or []):
-        if c["kind"] == "pair":
-            if q >= MAX_PAIRS:
-                raise ValueError("too many occlusion pair constraints for s2_jax")
-            pa_["pfa"][q], pa_["pfb"][q], pa_["pba"][q], pa_["pbb"][q] = c["fa"], c["fb"], c["ba"], c["bb"]
-            pf_["ptf"][q], pf_["ptb"][q], pf_["pweight"][q], pf_["pmargin"][q], pf_["pm"][q] = (
-                c["tf"], c["tb"], c["weight"], c["margin"], 1.0)
-            q += 1
-        else:
-            ts = np.asarray(c["ts"], float)
-            if n + len(ts) > MAX_SEG_PTS:
-                raise ValueError("too many occlusion sample points for s2_jax")
-            sl = slice(n, n + len(ts))
-            oa[sl], ob[sl], ot[sl] = c["a"], c["b"], ts
-            okind[sl] = 1.0 if c["kind"] == "behind" else -1.0
-            ow[sl], om[sl] = c["weight"], 1.0
-            n += len(ts)
-    s.update(oa=oa, ob=ob, ot=ot, okind=okind, ow=ow, om=om, **pa_, **pf_)
+    s.update(occlusion_arrays(order_cons))
     # physics (padded contacts)
     ci, cm = np.full(MAX_CONTACTS, IDX["pelvis"], np.int32), np.zeros(MAX_CONTACTS)
     mask_c = np.zeros((len(BM.EFFORT_JOINTS), MAX_CONTACTS))
@@ -713,4 +789,8 @@ def warmup():
     s = {k: jnp.asarray(v) for k, v in spec.items()}
     F(p, s).block_until_ready()
     JAC(p, s).block_until_ready()
+    row_mask(spec)                            # trace the block shapes once, at start-up
+    from .plausibility import Scorer
+    sc = Scorer(project(X, K), np.full(J, 0.9), K, X, valid, 1.70)
+    score_batch(np.repeat(X[None], 2, 0), scorer_spec(sc))
     return True

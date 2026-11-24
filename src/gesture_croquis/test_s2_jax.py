@@ -104,3 +104,28 @@ def test_standing_pose_no_nans():
     pb = fit_skeleton(**kw, jac="jax", _probe=True)
     Jm = pb["jac"](pb["p0"])
     assert np.isfinite(Jm).all() and np.isfinite(pb["fun"](pb["p0"])).all()
+
+
+@pytest.mark.parametrize("depth,cons", [(True, True), (False, False)])
+def test_batched_flip_search_matches_serial(depth, cons):
+    """#2: batched JAX scoring + lockstep descent = the original one-by-one numpy search."""
+    from gesture_croquis.plausibility import Scorer, _search_flips_serial, _search_flips_batched, flip_edges, \
+        flip_edges_batch, _combos, _mask_of
+    from gesture_croquis.s2_jax import scorer_spec, score_batch
+    kw = _problem(lunge_pose(), physics=False, depth=depth, cons=cons)
+    X, v, _ = fit_skeleton(**kw, iters=60)
+    sc = Scorer(kw["kpts2d"], kw["conf"], kw["K"], X, v, 1.70, kw["z_rel"], kw["z_conf"], order_cons=kw["order_cons"])
+    # batched flips == serial flips, batched score == Scorer.terms
+    combos = [e for _, e in _combos("torso")] + [e for _, e in _combos("l_arm")]
+    Xb = flip_edges_batch(np.repeat(X[None], len(combos), 0), kw["K"], np.stack([_mask_of(e) for e in combos]))
+    for e, Xf in zip(combos, Xb):
+        assert np.allclose(Xf, flip_edges(X, kw["K"], e), atol=1e-9)
+    tot = score_batch(Xb, scorer_spec(sc))
+    ref = np.array([sc.terms(Xf)["total"] for Xf in Xb])
+    assert np.allclose(tot, ref, rtol=1e-6, atol=1e-6)
+    a, b = _search_flips_serial(X, kw["K"], sc), _search_flips_batched(X, kw["K"], sc)
+    assert np.allclose([r[0] for r in a], [r[0] for r in b], rtol=1e-6, atol=1e-5)
+    # the top two (what S2 uses) are identical; lower ranks may differ only by a flip that changes the
+    # score less than the search's 1e-6 acceptance threshold (float rounding decides those ties)
+    for ra, rb in zip(a[:2], b[:2]):
+        assert ra[2] == rb[2] and np.allclose(ra[1], rb[1], atol=1e-9)
