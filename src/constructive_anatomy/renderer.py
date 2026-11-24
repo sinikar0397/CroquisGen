@@ -45,7 +45,7 @@ def _build(torso, shoulder, arm, leg, thickness):
     )
 
 
-# 등신이 낮을수록 머리가 크고 몸통/팔다리가 짧다. 숫자는 미술 해부학 등신표 기준
+# 등신이 낮을수록 머리가 크고 몸통/팔다리가 짧다.
 _BUILDS = {
     "child": _build(1.8, 1.4, ((1.1, 0.22, 0.16), (0.9, 0.16, 0.11)),
                     ((1.25, 0.34, 0.21), (1.2, 0.22, 0.13)), 0.85),  #6등신
@@ -54,12 +54,11 @@ _BUILDS = {
     "adult": _build(2.5, 1.8, ((1.5, 0.22, 0.16), (1.25, 0.16, 0.11)),
                     ((2.0, 0.34, 0.21), (1.9, 0.22, 0.13)), 1.0),  #8등신
 }
-# 측정 등신 경계. 실측은 미술 등신표보다 낮게 나온다: 성인 1명 웹캠 924프레임 중앙값 7.27
-# (p10 7.02, p90 8.11), 계획서 목업 사진 성인 7.3. 그래서 성인 경계를 6.9에 둠
-# shortcut: 성인 1명으로만 보정. 아동/청소년 실측이 생기면 아래 두 값을 다시 잡을 것
+# 등신 경계: 성인 1명 웹캠 평균 7.27
+# (p10 7.02, p90 8.11), 성인 경계를 6.9등신으로 설정
 HEADS_CHILD_MAX = 6.3
 HEADS_TEEN_MAX = 6.9
-HEADS_MARGIN = 0.15  #히스테리시스
+HEADS_MARGIN = 0.15  #히스테리시스값 설정
 HEADS_HOLD_FRAMES = 15  #이만큼 연속으로 다른 구간이어야 바꿈
 
 _BODY_FOLLOWERS = {  #관절을 보정하면 같이 따라 움직이는 점들
@@ -71,7 +70,7 @@ _BODY_FOLLOWERS = {  #관절을 보정하면 같이 따라 움직이는 점들
 PALM_WIDTH_P = 0.75  #검지 MCP -> 소지 MCP
 _FINGER = ((0.42, 0.10, 0.085), (0.27, 0.085, 0.075), (0.22, 0.075, 0.065))
 _THUMB_CHAIN = ((2, 3, 4), ((0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))  #1->2는 손바닥 안이라 뺌
-_FINGER_CHAINS = (  #검지부터 소지 순서. 손바닥 윗변을 이 순서로 만든다
+_FINGER_CHAINS = (  #검지부터 소지 순서. 손바닥 윗변을 이 순서로 제작
     ((5, 6, 7, 8), _FINGER),
     ((9, 10, 11, 12), ((0.46, 0.10, 0.085), (0.30, 0.085, 0.075), (0.24, 0.075, 0.065))),
     ((13, 14, 15, 16), _FINGER),
@@ -80,7 +79,7 @@ _FINGER_CHAINS = (  #검지부터 소지 순서. 손바닥 윗변을 이 순서�
 _HAND_CHAINS = (_THUMB_CHAIN, *_FINGER_CHAINS)
 
 
-class _Smoother:  #프레임 간 지수 스무딩. z가 더 튀어서 z만 alpha를 낮게
+class _Smoother:  #프레임 간 지수 스무딩
     def __init__(self, alpha_xy=0.55, alpha_z=0.25, max_gap_ms=500):
         self._alpha = np.array([alpha_xy, alpha_xy, alpha_z], dtype=np.float32)
         self._max_gap = max_gap_ms
@@ -89,7 +88,6 @@ class _Smoother:  #프레임 간 지수 스무딩. z가 더 튀어서 z만 alpha
 
     def update(self, timestamp_ms, points):
         previous = self._points
-        # timestamp가 안 늘거나(정지 이미지, 테스트) 너무 벌어지면 리셋
         if (previous is None or previous.shape != points.shape
                 or timestamp_ms <= self._ts or timestamp_ms - self._ts > self._max_gap):
             self._points = points.astype(np.float32).copy()
@@ -124,7 +122,7 @@ def _heads_estimate(result, world):
     return (torso + sum(legs) / len(legs)) / head + 1.6
 
 
-class _BuildPicker:  #등신 측정값으로 체형 프리셋 고르기. 경계에서 떨지 않게 히스테리시스 + 유지 프레임
+class _BuildPicker:  #등신 측정값으로 체형 고르기. 경계에서 이상해지지 않게 히스테리시스 + 유지 프레임
     def __init__(self, name="adult"):
         self.name = name
         self.heads = None  #스무딩된 측정값 (상태 표시, 디버그용)
@@ -156,7 +154,7 @@ class _BuildPicker:  #등신 측정값으로 체형 프리셋 고르기. 경계�
 
 
 def _head_unit(points, result, world, build):  #머리 높이(px) 추정
-    # 2D 어깨 폭, 몸통 길이는 원근으로 줄어들기만 하니까 큰 쪽이 진짜에 가깝다
+    # 2D 어깨 폭, 몸통 길이는 원근으로 줄어들기만 하니까 큰 쪽이 진짜에 가까움
     candidates = [0.0]
     if not visible(result, L_SHOULDER, R_SHOULDER):
         return 0.0
@@ -170,7 +168,7 @@ def _head_unit(points, result, world, build):  #머리 높이(px) 추정
         if hips:
             scales.append(_mid_dist(points, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP)
                           / max(_mid_dist(world, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP), 1e-3))
-        # 머리 높이(m)는 프리셋 비율표로 역산. 귀 폭으로 재면 2D 추정과 기준이 달라져서 안 씀
+        # 머리 높이(m)는 프리셋 비율표로 역산.
         head_m = _dist(world, L_SHOULDER, R_SHOULDER) / build["shoulder"]
         if hips:
             head_m = max(head_m, _mid_dist(world, L_SHOULDER, R_SHOULDER, L_HIP, R_HIP) / build["torso"])
@@ -179,7 +177,7 @@ def _head_unit(points, result, world, build):  #머리 높이(px) 추정
 
 
 def _correct_proportions(points, chains, unit, followers=None):
-    # 표준 길이보다 긴 마디는 끝 관절을 당겨 넣는다. 짧은 건 원근이니까 그대로 둠.
+    # 표준 길이보다 긴 마디는 끝 관절을 당겨 넣음. 짧은 건 원근이니까 그대로 둠.
     # 당긴 만큼 그 아래 관절(과 손발 점)도 같이 이동시켜 다음 마디 모양은 유지
     points = points.copy()
     followers = followers or {}
