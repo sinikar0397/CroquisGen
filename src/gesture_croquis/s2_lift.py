@@ -209,10 +209,12 @@ GROUP_NAMES = ["legs", "arms", "torso"]
 def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
                  w_hinge=1.0, w_depth=1.0, w_prior=1.0, iters=200, tol=1e-4,
                  height_sigma=0.07, prop_sigma=0.10, w_balance=1.0, physics=None, physics_p0=None,
-                 order_cons=None, w_order=1.0):
+                 order_cons=None, w_order=1.0, jac="auto", _probe=False):
     """Return (X (J,3) camera-frame metres, valid (J,), info).
     physics: optional biomech.Physics block — adds its residuals (passive muscle, gravity effort,
-    balance, floor) and its parameters (camera pitch) to the same least-squares problem."""
+    balance, floor) and its parameters (camera pitch) to the same least-squares problem.
+    jac: "auto" = exact Jacobian via JAX (s2_jax.py) when jax is installed, else finite
+    differences; "jax" = require JAX; "fd" = SciPy finite differences (the original path)."""
     from .plausibility import twist_terms, collision_terms
     from .occlusion import order_terms
     valid = conf > CONF_MIN
@@ -294,14 +296,36 @@ def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
         p0 = np.r_[p0, 0.0]
     if physics is not None:
         p0 = np.r_[p0, physics_p0 if physics_p0 is not None else np.zeros(physics.n_params)]
+    fun, jac_fn, jac_used = residuals, "2-point", "fd"
+    if jac in ("auto", "jax"):
+        from . import s2_jax
+        if s2_jax.available():
+            spec = s2_jax.build_spec(
+                kpts2d, conf, K, height, valid, park, sig_px, use_depth,
+                E=E if use_depth else None, ew=ew if use_depth else None, ezr=ezr if use_depth else None,
+                w_hinge=w_hinge, w_depth=w_depth, w_prior=w_prior, height_sigma=height_sigma,
+                prop_sigma=prop_sigma, w_balance=w_balance, physics=physics, order_cons=order_cons,
+                w_order=w_order if order_cons else 0.0, hinge_ok=hinge_ok if w_hinge else np.zeros(5, bool))
+            cols = [3 * j + k for j in vi for k in range(3)] + [3 * J + k for k in range(4)]
+            if use_depth:
+                cols.append(3 * J + 4)
+            if physics is not None:
+                cols.append(3 * J + 5)
+            fun, jac_fn = s2_jax.make_fun_jac(spec, cols, np.zeros(s2_jax.NP))
+            jac_used = "jax"
+        elif jac == "jax":
+            raise ImportError("fit_skeleton(jac='jax') needs `pip install jax`")
+    if _probe:                                         # for tests: the problem, not the solution
+        return dict(residuals=residuals, p0=p0, fun=fun, jac=jac_fn, jac_used=jac_used)
     t0 = time.perf_counter()
-    sol = least_squares(residuals, p0, loss="soft_l1", f_scale=3.0, max_nfev=iters,
+    sol = least_squares(fun, p0, jac=jac_fn, loss="soft_l1", f_scale=3.0, max_nfev=iters,
                         x_scale="jac", method="trf", ftol=tol, xtol=1e-7, gtol=tol)   # xtol is relative to |x| (metres at 2-20 m): keep it tight
     X, log_sz, log_h, g = unpack(sol.x)
     reproj = np.linalg.norm(project(X[vi], K) - kpts2d[vi], axis=1)
     Lf = np.linalg.norm(X[bi[:, 0]] - X[bi[:, 1]], axis=1)
     bL = bL * np.exp(log_h + g[bg])
-    info = dict(cost=float(sol.cost), nfev=int(sol.nfev), fit_ms=1e3 * (time.perf_counter() - t0),
+    info = dict(cost=float(sol.cost), nfev=int(sol.nfev), njev=int(sol.njev or 0), jac=jac_used,
+                fit_ms=1e3 * (time.perf_counter() - t0),
                 reproj_px_median=float(np.median(reproj)), reproj_px_max=float(reproj.max()),
                 bone_err_pct_median=float(np.median(np.abs(Lf - bL) / bL) * 100),
                 hinge=dict(zip(["l_knee", "l_ankle", "r_knee", "r_ankle", "head"],
@@ -539,6 +563,10 @@ def run_fits(jobs, workers=None):
     global _POOL
     import os
     workers = workers if workers is not None else min(8, os.cpu_count() or 1)
+    if any(kw.get("jac", "auto") != "fd" for kw in jobs):
+        from . import s2_jax
+        if s2_jax.available():          # exact-Jacobian fits are fast: no process pool (each worker
+            workers = 1                 # would recompile, and JAX is not fork-safe)
     if workers <= 1 or len(jobs) <= 1:
         return [fit_skeleton(**kw) for kw in jobs]
     try:
@@ -570,15 +598,27 @@ class Lifter3D:
                  device: str = "auto", dynamic: bool = False, search: bool = True,
                  physical: bool = True, mass: float | None = None, n_physical: int = 2,
                  label_swaps: bool = True, swap_prior: float = 3.0, workers: int | None = None,
-                 occlusion: bool = True):
+                 occlusion: bool = True, jac: str = "auto"):
         self.backend, self.height, self.z_sign = backend, height, z_sign
         self.dynamic, self.search = dynamic, search
         self.physical, self.mass, self.n_physical = physical, mass, n_physical
         self.label_swaps, self.swap_prior, self.workers = label_swaps, swap_prior, workers
         self.occlusion = occlusion
         self.phys_tol = 1e-3
-        self.fit_kw = dict(w_balance=0.0 if dynamic else 1.0)
+        self.fit_kw = dict(w_balance=0.0 if dynamic else 1.0, jac=jac)
         self.depth = RTMW3DDepth(device) if backend == "rtmw3d" else None
+        self.jac = "fd"
+        if jac != "fd":
+            from . import s2_jax
+            if s2_jax.available():
+                t = time.perf_counter()
+                s2_jax.warmup()                       # compile once (or load the on-disk cache)
+                self.jac = "jax"
+                print(f"[S2] exact Jacobian via JAX (compile/cache load {time.perf_counter() - t:.1f}s)")
+            elif jac == "jax":
+                raise ImportError("--jac jax needs `pip install jax`")
+            else:
+                print("[S2] jax not installed: finite-difference Jacobian (pip install jax for ~10x faster S2)")
 
     # ------------------------------------------------------------------
     def __call__(self, frame, img_bgr=None, K=None, X_prev=None):

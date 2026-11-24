@@ -35,15 +35,15 @@ IMG_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 class Pipeline:
     """Holds the loaded models so repeated calls (batch now, webcam later) skip re-loading."""
 
-    def __init__(self, s1="halpe26", mode="balanced", s2="rtmw3d", height=1.70, device="auto",
-                 z_sign="auto", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
-                 search=True, physical=True, label_swaps=True, workers=None, occlusion=True):
+    def __init__(self, s1="halpe26", mode="balanced", s2="rtmw3d", height=1.70, device="cpu",
+                 z_sign="-", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
+                 search=True, physical=True, label_swaps=True, workers=None, occlusion=True, jac="auto"):
         from .s1_keypoints import RTMPose2D
         t = time.perf_counter()
         self.s1 = RTMPose2D(s1, mode=mode, device=device)
         self.s2 = Lifter3D(s2, height=height, z_sign=z_sign, device=device, dynamic=dynamic, search=search,
                            physical=physical, mass=mass, label_swaps=label_swaps, workers=workers,
-                           occlusion=occlusion)
+                           occlusion=occlusion, jac=jac)
         self.s3 = dict(body_mass=mass, contacts=contacts, sagittal=sagittal) if s3 else None
         print(f"[init] models ready in {time.perf_counter() - t:.1f}s  (S1 device: {self.s1.device})")
 
@@ -187,8 +187,12 @@ def main():
     ap.add_argument("--s2", default="rtmw3d", choices=["rtmw3d", "geometric"])
     ap.add_argument("--height", type=float, default=1.70, help="subject height prior, metres")
     ap.add_argument("--fov", type=float, default=55.0, help="horizontal FOV if no EXIF focal length")
-    ap.add_argument("--z-sign", default="auto", choices=["auto", "+", "-"])
-    ap.add_argument("--device", default="auto", help="auto | cpu | mps (CoreML) | cuda")
+    ap.add_argument("--z-sign", default="-", choices=["auto", "+", "-"],
+                    help="RTMW3D depth sign. Default '-' (what real photos picked); 'auto' fits both (2x the fits)")
+    ap.add_argument("--jac", default="auto", choices=["auto", "jax", "fd"],
+                    help="S2 Jacobian: exact via JAX (auto, if installed) or finite differences (fd, slow)")
+    ap.add_argument("--device", default="cpu",
+                    help="cpu (default: CoreML failed on these models and fell back anyway) | auto | mps | cuda")
     ap.add_argument("--mass", type=float, default=None, help="body mass kg (default: BMI 22 from height)")
     ap.add_argument("--contacts", default=None,
                     help="comma list overriding auto contacts, e.g. lheel,rbigtoe,pelvis (pelvis = seated)")
@@ -229,7 +233,8 @@ def main():
     pipe = Pipeline(a.s1, a.mode, a.s2, a.height, a.device, a.z_sign, s3=not a.no_s3,
                     mass=a.mass, contacts=contacts, sagittal=a.sagittal, dynamic=a.dynamic,
                     search=not a.no_search, physical=not a.no_physical,
-                    label_swaps=not a.no_label_swaps, workers=a.workers, occlusion=not a.no_occlusion)
+                    label_swaps=not a.no_label_swaps, workers=a.workers, occlusion=not a.no_occlusion,
+                    jac=a.jac)
     print(f"[init] total {1e3 * (time.perf_counter() - t_init):.0f} ms (model loading, not counted per image)")
     for p in paths:
         t_img = time.perf_counter()
@@ -250,7 +255,7 @@ def main():
         print(f"{Path(p).name}: people {i['n_people']} | S1 det {i['s1_det_ms']:.0f} ms + pose "
               f"{i['s1_pose_ms']:.0f} ms | S2 {i['s2_total_ms']:.0f} ms | reproj {i['reproj_px_median']:.1f}px "
               f"| bones {i['bone_err_pct_median']:.1f}% | dist {i['subject_distance_m']:.2f} m"
-              + (f" | z-sign {i['z_sign']:+d} (x{i.get('z_sign_cost_ratio', 0):.2f}, init {i.get('init')})" if "z_sign" in i else "")
+              + (f" | z-sign {i['z_sign']:+d} (init {i.get('init')})" if "z_sign" in i else "")
               + f" | fitted height {i['fitted_height_m']:.2f} m")
         if "physics" in i:
             ph = i["physics"]

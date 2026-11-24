@@ -48,7 +48,8 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 | `--s2` | `rtmw3d` | `rtmw3d` (depth network) or `geometric` (no 3D net, rough) |
 | `--height` | `1.70` | subject height prior in metres. Sets bone lengths and therefore the distance to the camera |
 | `--fov` | `55` | horizontal FOV used when the photo has no EXIF focal length |
-| `--z-sign` | `auto` | RTMW3D depth convention check (see below) |
+| `--z-sign` | `-` | RTMW3D depth sign. `-` is what real photos picked; `auto` fits both signs (2× the fits) |
+| `--jac` | `auto` | S2 Jacobian: exact via JAX (`auto`/`jax`, needs `pip install jax`) or finite differences (`fd`, ~10× slower) |
 | `--dynamic` | off | running/jumping/falling: no balance prior, low effort weight |
 | `--no-search` | off | skip the plausibility search over depth flips |
 | `--no-physical` | off | skip the integrated S2+S3 physical fit |
@@ -59,7 +60,14 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 | `--views` | `0` | S4 views, `yaw[:pitch]` list in degrees: `0,90,-45:20` (0 = photo camera) |
 | `--layers` | `AB` | S4 layers: A line of action, B gesture/rhythm, C construction volumes |
 | `--exaggeration` | `0.35` | how far the line of action is pushed off its chord (0.2–0.5) |
-| `--device` | `auto` | `mps` = CoreML EP; falls back to CPU automatically if CoreML rejects the model |
+| `--device` | `cpu` | `mps` = CoreML EP; falls back to CPU automatically if CoreML rejects the model |
+
+## S2 speed: exact Jacobian (`s2_jax.py`)
+Profiling showed about 90% of S2 in SciPy's finite-difference Jacobian: about 90 extra residual evaluations per solver step. `s2_jax.py` reimplements the same residuals in `jax.numpy`, and `fit_skeleton` passes their exact forward-mode Jacobian to `least_squares`. The covered residuals are the image terms, anatomy, twist, collision, occlusion order, physics and muscle stress.
+* **Fixed shapes.** Contacts and occlusion constraints are padded and masked, so one XLA compilation serves every fit. It is cached on disk in `~/.cache/croquisgen/jax`: about 17 s the first time on a machine, about 3 s per run after that. It is compiled at `Pipeline` start-up, not during the first image.
+* **Serial fits.** With JAX the fits run in the main process, so there is no process pool to start.
+* **Numpy stays the reference.** `test_s2_jax.py` checks that the residuals are identical and that Jᵀr and JᵀJ match finite differences within 1e-4, on several problem variants. **If you edit a residual in s2_lift / biomech / muscles / plausibility / occlusion, mirror it in s2_jax.py**; the test fails until you do.
+* **Measured** on the synthetic lunge: one physics fit 2.66 s → 0.10 s; the whole S2 stage (all hypotheses, flip search, physical refinement) 15.6 s → 1.6 s, with the same winning pose and cost. Without jax installed, the old finite-difference path is used automatically.
 
 ## How S2 works
 One least-squares fit (`fit_skeleton`) of the canonical skeleton in the camera frame (metres):
