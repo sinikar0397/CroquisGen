@@ -16,7 +16,9 @@ from constructive_anatomy.renderer import (  # noqa: E402
     _Smoother,
     _correct_proportions,
     _foreshortening,
+    _palm_normal,
     _palm_outline,
+    _slab_outline,
 )
 from core.landmarks import L_ELBOW, L_INDEX, L_PINKY, L_SHOULDER, L_WRIST  # noqa: E402
 
@@ -76,6 +78,44 @@ def test_palm_outline_includes_thumb_only_when_it_sticks_out():
     # 손목 모서리 2 + 손가락 4개 x 밑동 2 = 10, 엄지가 나가 있으면 +2
     assert len(folded) == 10
     assert len(spread) == 12
+    # 엄지가 손가락 쪽으로 누우면(손등 보이는 포즈) 밑동이 윤곽을 파고들어 홈이 생기니 빼야 함
+    pts = _flat_hand((36, 62))
+    pts[3], pts[4] = (28, 74), (22, 84)
+    down = _palm_outline(pts, P=40.0)
+    assert len(down) == 10
+
+
+def test_palm_slab_gets_thickness_when_seen_edge_on():
+    import cv2
+    square = np.array([(20, 20), (40, 20), (40, 40), (20, 40)], np.float32)
+    flat = _slab_outline(square, np.zeros(2, np.float32), (100, 100))  #정면 -> 그냥 사각형
+    side = _slab_outline(square, np.array([10.0, 0.0], np.float32), (100, 100))  #옆으로 10px 두께
+    assert len(flat) == 4
+    assert cv2.boundingRect(side)[2] == cv2.boundingRect(flat)[2] + 10
+
+    # 법선은 항상 카메라 쪽(z가 작은 쪽)을 향해야 함
+    pts = _flat_hand((30, 70))
+    z = np.zeros(21, np.float32)
+    z[17] = 20  #소지 쪽이 멀어진 손
+    n = _palm_normal(pts, z)
+    assert n[2] < 0
+    assert _palm_normal(pts, -z)[2] < 0
+
+
+def test_hand_drawing_stays_inside_the_canvas():
+    # 손가락이 카메라 쪽으로 누워 랜드마크 상자가 납작한 손: fit 확대가 커져서 손바닥 모서리가 화면을 넘기 쉬움
+    from constructive_anatomy.renderer import PAPER, ConstructiveRenderer
+    from core.types import PerceptionResult, Target
+    pts = _flat_hand((30, 70))
+    for base in (5, 9, 13, 17):
+        pts[base:base + 4, 1] = 55
+    pts[0] = (50, 62)
+    hand = np.column_stack([pts / 100.0, np.zeros(21)]).astype(np.float32)
+    img = ConstructiveRenderer().render(
+        PerceptionResult(width=640, height=480, timestamp_ms=1, hand=hand), Target.HAND, (640, 480))
+    border = np.concatenate([img[:2].reshape(-1, 3), img[-2:].reshape(-1, 3),
+                             img[:, :2].reshape(-1, 3), img[:, -2:].reshape(-1, 3)])
+    assert (border == PAPER).all()
 
 
 def test_cylinder_fill_stays_inside_the_cylinder():

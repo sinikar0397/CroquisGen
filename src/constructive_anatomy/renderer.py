@@ -69,6 +69,7 @@ _BODY_FOLLOWERS = {  #관절을 보정하면 같이 따라 움직이는 점들
 
 # 손은 단위 P = 손바닥 길이 (손목 -> 중지 MCP)
 PALM_WIDTH_P = 0.75  #검지 MCP -> 소지 MCP
+PALM_THICK_P = 0.25  #손바닥 두께. 옆에서 보면 이 폭의 판으로 보여야 함
 _FINGER = ((0.42, 0.10, 0.085), (0.27, 0.085, 0.075), (0.22, 0.075, 0.065))
 _THUMB_CHAIN = ((2, 3, 4), ((0.33, 0.12, 0.10), (0.27, 0.10, 0.085)))  #1->2는 손바닥 안이라 뺌
 _FINGER_CHAINS = (  #검지부터 소지 순서. 손바닥 윗변을 이 순서로 제작
@@ -310,6 +311,35 @@ def _add_polygon(scene, depth, pts, thick, extra=None):
     scene.add(depth, lambda c: cv2.fillPoly(c, [poly], PAPER, cv2.LINE_8), stroke)
 
 
+def _slab_outline(poly, offset, size):
+    # 다각형을 offset만큼 밀어낸 판(앞면 poly+offset/2, 뒷면 poly-offset/2)의 바깥 윤곽
+    # 앞면·뒷면·옆면을 마스크에 다 채우고 외곽선만 뽑는다. 정면이면 poly 그대로 나옴
+    near, far = poly + offset / 2, poly - offset / 2
+    mask = np.zeros((size[1], size[0]), np.uint8)
+    for quad in zip(near, np.roll(near, -1, axis=0), np.roll(far, -1, axis=0), far):
+        cv2.fillPoly(mask, [np.array(quad, np.int32)], 255, cv2.LINE_8)
+    cv2.fillPoly(mask, [near.astype(np.int32)], 255, cv2.LINE_8)
+    cv2.fillPoly(mask, [far.astype(np.int32)], 255, cv2.LINE_8)
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    return max(contours, key=cv2.contourArea).reshape(-1, 2) if contours else near.astype(np.int32)
+
+
+def _add_slab(scene, depth, poly, offset, thick, size, extra=None):
+    outline = _slab_outline(poly, offset, size)
+    near = (poly + offset / 2).astype(np.int32)
+    far = (poly - offset / 2).astype(np.int32)
+
+    def stroke(c, ink, ghost):
+        cv2.polylines(c, [outline], True, ink, thick, cv2.LINE_AA)
+        cv2.polylines(c, [near], True, ink, thick, cv2.LINE_AA)
+        if ghost:  #뒷면은 가려진 선으로만
+            cv2.polylines(c, [far], True, ink, thick, cv2.LINE_AA)
+        if extra:
+            extra(c, ink, ghost)
+
+    scene.add(depth, lambda c: cv2.fillPoly(c, [outline], PAPER, cv2.LINE_8), stroke)
+
+
 def _add_ellipsoid(scene, depth, centre, up, half_w, half_h, depth_r, facing, thick, thin,
                    ring_at, ring_squash, ring_toward):
     # 타원체 = 윤곽 + 중심선(카메라 향한 쪽으로 쏠림) + 가로 단면선 하나
@@ -353,11 +383,19 @@ def _palm_outline(points, P):
         d = p - wrist_index
         return float(edge[0] * d[1] - edge[1] * d[0])
     centre = points[[0, 5, 9, 13, 17]].mean(axis=0)
-    # 엄지가 손바닥 안으로 접히면 MCP가 안쪽에 들어와서 다각형이 꼬임 -> 그땐 윤곽에서 빼고 위에 얹기만
-    thumb_out = side(points[_THUMB_CHAIN[0][0]]) * side(centre) < 0
-    thumb = (_base_edge(points, _THUMB_CHAIN[0], _THUMB_CHAIN[1][0][1] * P, edge)
-             if thumb_out else [])
+    # 엄지가 손바닥 안으로 접히거나 손가락 쪽으로 누우면 밑동 끝점이 가장자리 안쪽에 들어와 다각형이 꼬임
+    # -> 밑동 양 끝이 다 바깥에 있을 때만 윤곽에 넣고, 아니면 위에 얹기만
+    thumb = _base_edge(points, _THUMB_CHAIN[0], _THUMB_CHAIN[1][0][1] * P, edge)
+    if any(side(p) * side(centre) >= 0 for p in thumb):
+        thumb = []
     return np.array([wrist_index, *thumb, *top, wrist_pinky])
+
+
+def _palm_normal(points, z):  #손바닥 평면 법선. 카메라 쪽(z 작은 쪽)을 향하게 뒤집음
+    p = np.column_stack([points, z])
+    n = np.cross(p[5] - p[0], p[17] - p[0])
+    n = n / (np.linalg.norm(n) or 1.0)
+    return -n if n[2] > 0 else n
 
 
 def _add_chain(scene, points, depth, chain, segments, unit, thick, thin, *,
@@ -523,20 +561,33 @@ class ConstructiveRenderer:
         hand = self._hand_filter.update(result.timestamp_ms, result.hand)
         points = scaled_points(hand, size, fit=0.12)
         depth = hand[:, 2]
+        # z를 px 단위로 맞춰서 손바닥 법선을 구함 (z는 x와 같은 스케일)
+        px_per_unit = (np.linalg.norm(points[9] - points[0])
+                       / (np.linalg.norm(hand[9, :2] - hand[0, :2]) or 1.0))
+        normal = _palm_normal(points, depth * px_per_unit)
         # 손바닥 길이 (fit 확대 후 기준). 옆에서 본 손은 폭으로 대신
         P = max(float(np.linalg.norm(points[0] - points[9])),
                 float(np.linalg.norm(points[5] - points[17])) / PALM_WIDTH_P)
         if P < 3:
             return
         points = _correct_proportions(points, _HAND_CHAINS, P)
+        # 손목 모서리(0.28P)랑 손바닥 두께가 랜드마크 상자 밖으로 나가니, 그만큼 여유가 없으면 화면 중심 기준으로 줄임
+        need = points.max(axis=0) - points.min(axis=0) + 0.8 * P
+        shrink = min(1.0, float(np.min(np.array(size) * 0.96 / need)))
+        if shrink < 1.0:
+            centre = np.array(size, dtype=np.float32) / 2
+            points = (points - centre) * shrink + centre
+            P *= shrink
         thick = max(2, int(round(P * 0.022)))
         thin = max(1, thick // 2)
 
         palm = _palm_outline(points, P)
+        offset = normal[:2] * PALM_THICK_P * P  #두께를 화면에 투영한 벡터. 정면이면 0에 가까움
         mid_a, mid_b = (palm[0] + points[5]) / 2, (palm[-1] + points[17]) / 2  #손목 모서리~검지/소지 MCP 중간
-        _add_polygon(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, thick,
-                     extra=lambda c, ink, ghost: cv2.line(c, _pt(mid_a), _pt(mid_b), ink, thin,
-                                                          cv2.LINE_AA))
+        mid_a, mid_b = mid_a + offset / 2, mid_b + offset / 2  #앞면 위에
+        _add_slab(scene, float(np.mean(depth[[0, 2, 5, 9, 13, 17]])), palm, offset, thick, size,
+                  extra=lambda c, ink, ghost: cv2.line(c, _pt(mid_a), _pt(mid_b), ink, thin,
+                                                       cv2.LINE_AA))
 
         for chain, segments in _HAND_CHAINS:
             _add_chain(scene, points, depth, chain, segments, P, thick, thin,
