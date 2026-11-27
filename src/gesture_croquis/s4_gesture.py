@@ -66,6 +66,7 @@ class S4Params:
     support_w: float = 0.6
     resid_w: float = 25.0
     backtrack_w: float = 10.0
+    loa_hysteresis: float = 0.15        # video: the previous frame's LOA chain wins unless beaten by 15%
 
 
 @dataclass
@@ -191,34 +192,67 @@ def bezier_even(ctrl, n=100):
     return Q
 
 
+_TT = np.linspace(0, 1, 256)
+_BTT = None
+
+
+def _basis_b(t):
+    """Cubic Bernstein basis for a batch of parameters t (..., N) -> (..., N, 4)."""
+    u = 1 - t
+    return np.stack([u ** 3, 3 * u * u * t, 3 * u * t * t, t ** 3], -1)
+
+
+def fit_cubic_bezier_batch(Pb, iters=8):
+    """fit_cubic_bezier for C curves at once: Pb (C, N, D), same N. Same algorithm (chord-length
+    start, `iters` rounds of nearest-point re-parameterisation + 2 Newton steps); all candidates
+    in one numpy pass instead of a Python loop per curve. Returns (ctrl (C,4,D), resid (C,))."""
+    global _BTT
+    if _BTT is None:
+        _BTT = _basis_b(_TT)
+    Pb = np.asarray(Pb, float)
+    C_, N, D = Pb.shape
+    seg = np.linalg.norm(np.diff(Pb, axis=1), axis=2)
+    L = np.maximum(seg.sum(1), 1e-9)
+    d = np.concatenate([np.zeros((C_, 1)), np.cumsum(seg, 1)], 1)
+    t = np.where(d[:, -1:] > 1e-9, d / np.maximum(d[:, -1:], 1e-12), np.linspace(0, 1, N)[None])
+    P0, P3 = Pb[:, 0], Pb[:, -1]
+    for it in range(iters + 1):
+        B = _basis_b(t)                                                  # (C,N,4)
+        rhs = Pb - B[..., 0:1] * P0[:, None] - B[..., 3:4] * P3[:, None]
+        A = B[..., 1:3]                                                  # (C,N,2)
+        try:                                                             # 2x2 normal equations per curve
+            P12 = np.linalg.solve(A.transpose(0, 2, 1) @ A, A.transpose(0, 2, 1) @ rhs)
+        except np.linalg.LinAlgError:                                    # degenerate curve: least squares
+            P12 = np.stack([np.linalg.lstsq(A[c], rhs[c], rcond=None)[0] for c in range(C_)])
+        ctrl = np.concatenate([P0[:, None], P12, P3[:, None]], 1)       # (C,4,D)
+        if it == iters:
+            break
+        dense = _BTT[None] @ ctrl                                        # (C,256,D)
+        # |p - q|^2 = |q|^2 - 2 p.q (+ |p|^2, constant per point): a BLAS matmul, same argmin
+        dist = (dense * dense).sum(-1)[:, None, :] - 2.0 * (Pb @ dense.transpose(0, 2, 1))   # (C,N,256)
+        t = _TT[np.argmin(dist, axis=2)]
+        dc = ctrl[:, 1:] - ctrl[:, :-1]                                  # (C,3,D)
+        dd = ctrl[:, 2:] - 2 * ctrl[:, 1:-1] + ctrl[:, :-2]              # (C,2,D)
+        for _ in range(2):                                               # Newton steps on |B(t) - p|^2
+            u = 1 - t
+            Bt = _basis_b(t) @ ctrl
+            d1 = 3 * ((u * u)[..., None] * dc[:, None, 0] + (2 * u * t)[..., None] * dc[:, None, 1]
+                      + (t * t)[..., None] * dc[:, None, 2])
+            d2 = 6 * (u[..., None] * dd[:, None, 0] + t[..., None] * dd[:, None, 1])
+            r = Bt - Pb
+            den = (d1 * d1).sum(-1) + (r * d2).sum(-1)
+            t = np.clip(t - (r * d1).sum(-1) / np.where(np.abs(den) > 1e-9, den, 1e-9), 0, 1)
+        t = np.maximum.accumulate(t, axis=1)
+        t[:, 0], t[:, -1] = 0.0, 1.0
+    resid = np.linalg.norm(_basis_b(t) @ ctrl - Pb, axis=2).mean(1) / L
+    return ctrl, resid
+
+
 def fit_cubic_bezier(pts, iters=8):
     """Least-squares cubic Bezier with fixed end points; chord-length start, then `iters`
     rounds of nearest-point re-parameterisation. Returns (ctrl (4,D), residual / arc length)."""
-    pts = np.asarray(pts, float)
-    L = max(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum(), 1e-9)
-    t = _arc_t(pts)
-    P0, P3 = pts[0], pts[-1]
-    for it in range(iters + 1):
-        B = _bez_basis(t)
-        rhs = pts - np.outer(B[:, 0], P0) - np.outer(B[:, 3], P3)
-        P12, *_ = np.linalg.lstsq(B[:, 1:3], rhs, rcond=None)
-        ctrl = np.vstack([P0, P12, P3])
-        if it == iters:
-            break
-        tt = np.linspace(0, 1, 256)
-        dense = _bez_basis(tt) @ ctrl
-        t = tt[np.argmin(((pts[:, None] - dense[None]) ** 2).sum(-1), axis=1)]
-        for _ in range(2):                                         # Newton steps on |B(t) - p|^2
-            Bt = _bez_basis(t) @ ctrl
-            d1 = 3 * ((1 - t)[:, None] ** 2 * (ctrl[1] - ctrl[0]) + 2 * ((1 - t) * t)[:, None] * (ctrl[2] - ctrl[1])
-                      + (t ** 2)[:, None] * (ctrl[3] - ctrl[2]))
-            d2 = 6 * ((1 - t)[:, None] * (ctrl[2] - 2 * ctrl[1] + ctrl[0]) + t[:, None] * (ctrl[3] - 2 * ctrl[2] + ctrl[1]))
-            r = Bt - pts
-            den = (d1 * d1).sum(1) + (r * d2).sum(1)
-            t = np.clip(t - (r * d1).sum(1) / np.where(np.abs(den) > 1e-9, den, 1e-9), 0, 1)
-        t = np.maximum.accumulate(t); t[0], t[-1] = 0.0, 1.0
-    resid = float(np.linalg.norm(_bez_basis(t) @ ctrl - pts, axis=1).mean() / L)
-    return ctrl, resid
+    ctrl, resid = fit_cubic_bezier_batch(np.asarray(pts, float)[None], iters)
+    return ctrl[0], float(resid[0])
 
 
 def _normal2(chord):
@@ -475,10 +509,11 @@ def _loa_candidates(b: BodyView):
     return cands
 
 
-def line_of_action(b: BodyView, prm: S4Params):
+def line_of_action(b: BodyView, prm: S4Params, prefer=None):
     """Score every candidate chain; fit, exaggerate and return the winner as a stroke."""
     ref = b.body_px()
     rows, best = [], None
+    cands = []
     for name, (parts, leg) in _loa_candidates(b).items():
         ch = b.chain(parts)
         if ch is None or len(ch["uv"]) < 3:
@@ -486,7 +521,11 @@ def line_of_action(b: BodyView, prm: S4Params):
         P, (E, C, Z), L = resample(ch["uv"], 64, ch["effort"], ch["compression"], ch["z"])
         if L < 1e-6:
             continue
-        ctrl, resid = fit_cubic_bezier(P)
+        cands.append((name, parts, leg, ch, P, E, C, Z, L))
+    if cands:                                           # all candidate curves fitted in one pass
+        CT, RS = fit_cubic_bezier_batch(np.stack([c[4] for c in cands]))
+    for k, (name, parts, leg, ch, P, E, C, Z, L) in enumerate(cands):
+        ctrl, resid = CT[k], float(RS[k])
         load = float(E.mean())
         sup = b.support.get(leg, 0.0) if leg else 0.0
         back = _backtrack(P)
@@ -494,11 +533,12 @@ def line_of_action(b: BodyView, prm: S4Params):
                  / (1 + prm.resid_w * resid) / (1 + prm.backtrack_w * back))
         rows.append(dict(name=name, score=round(score, 4), length_px=round(L, 1), load=round(load, 3),
                          support=round(sup, 3), resid=round(resid, 4), backtrack=round(back, 3)))
-        if best is None or score > best[0]:
-            best = (score, name, ch, ctrl, resid, E, C, Z, sup, parts)
+        rank = score * (1 + prm.loa_hysteresis) if prefer is not None and name == prefer else score
+        if best is None or rank > best[-1]:
+            best = (score, name, ch, ctrl, resid, E, C, Z, sup, parts, rank)
     if best is None:
         raise ValueError("S4: no valid line-of-action chain (too few joints)")
-    score, name, ch, ctrl, resid, E, C, Z, sup, parts = best
+    score, name, ch, ctrl, resid, E, C, Z, sup, parts, _ = best
     ctrl_x = exaggerate(ctrl, prm.exaggeration)
     pts = bezier_even(ctrl_x, 120)
     t = np.linspace(0, 1, 64)
@@ -548,7 +588,8 @@ def rhythm_lines(b: BodyView, prm: S4Params, loa_joints):
     working / shortened muscles (S3), reduced on a limb whose muscles are passively stretched."""
     out = []
     k = prm.exaggeration * prm.limb_exaggeration
-    for s in "lr":
+    limbs = {}
+    for s in "lr":                                      # pass 1: chains, resampled
         for kind, js in (("arm", [s + "sho", s + "elb", s + "wri", s + "hand"]),
                          ("leg", [s + "hip", s + "knee", s + "ank"])):
             valid = []
@@ -560,9 +601,20 @@ def rhythm_lines(b: BodyView, prm: S4Params, loa_joints):
                 continue
             ch = b.chain(valid)
             P, (E, C, Z), L = resample(ch["uv"], 48, ch["effort"], ch["compression"], ch["z"])
-            if L < 1e-6:
+            if L >= 1e-6:
+                limbs[(s, kind)] = (valid, ch, P, E, C, Z, L)
+    fits = {}
+    multi = [key for key, v in limbs.items() if len(v[0]) > 2]
+    if multi:                                           # all limb curves fitted in one pass
+        CT, RS = fit_cubic_bezier_batch(np.stack([limbs[key][2] for key in multi]))
+        fits = {key: (CT[i], float(RS[i])) for i, key in enumerate(multi)}
+    for s in "lr":                                      # pass 2: shape, bias, strokes (same order as before)
+        for kind in ("arm", "leg"):
+            if (s, kind) not in limbs:
                 continue
-            ctrl, resid = fit_cubic_bezier(P) if len(valid) > 2 else (np.vstack([P[0], P[16], P[32], P[-1]]), 0.0)
+            valid, ch, P, E, C, Z, L = limbs[(s, kind)]
+            ctrl, resid = fits[(s, kind)] if (s, kind) in fits else (np.vstack([P[0], P[16], P[32], P[-1]]), 0.0)
+            ctrl = ctrl.copy()
             ctrl = exaggerate(ctrl, k)
             # muscle-side bias
             bias3 = np.zeros(3); passive = 0.0
@@ -817,8 +869,10 @@ def assign_weights(strokes, b: BodyView, prm: S4Params, S: float):
 
 # ============================================================================== entry point
 def build_croquis(frame, view: View | None = None, params: S4Params | None = None,
-                  layers: str = "AB", exaggeration: float | None = None) -> Croquis:
-    """PoseFrame -> Croquis (strokes in view px with per-sample widths)."""
+                  layers: str = "AB", exaggeration: float | None = None, prefer_loa: str | None = None) -> Croquis:
+    """PoseFrame -> Croquis (strokes in view px with per-sample widths).
+    prefer_loa (video): the previous frame's LOA chain name; it keeps winning unless another chain
+    scores params.loa_hysteresis (15%) higher, so the line does not jump between near-equal chains."""
     view = view or View()
     prm = params or S4Params()
     if exaggeration is not None:
@@ -831,7 +885,7 @@ def build_croquis(frame, view: View | None = None, params: S4Params | None = Non
 
     b = BodyView(frame, view); lap("view")
     S = b.unit()
-    loa, loa_info = line_of_action(b, prm); lap("loa")
+    loa, loa_info = line_of_action(b, prm, prefer=prefer_loa); lap("loa")
     strokes = [loa]
     limbs = rhythm_lines(b, prm, set(loa_info["joints"])); lap("limbs")
     torso, torso_info = torso_lines(b, prm); lap("torso")
@@ -869,18 +923,33 @@ LOA_COLOR = (40, 40, 220)            # BGR red: the line of action stands out fr
 
 
 def _draw_stroke(img, pts, w, color, closed):
-    """Variable-width stroke as quads + round joins (handles closed and self-touching strokes)."""
+    """Variable-width stroke. Open strokes: one outline polygon (offset curves, both sides) with
+    round end caps, plus filled circles only where a sharp bend could fold the offset outline.
+    Closed strokes (few: head, construction ellipses) keep quads + round joins."""
     import cv2
     P = np.asarray(pts, float)
+    w = np.asarray(w, float)
     if closed:
         P = np.vstack([P, P[:1]]); w = np.r_[w, w[:1]]
     tang = np.gradient(P, axis=0)
     tang /= np.linalg.norm(tang, axis=1, keepdims=True) + 1e-9
-    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1) * (np.asarray(w)[:, None] / 2)
-    for k in range(len(P) - 1):
-        q = np.array([P[k] + nrm[k], P[k + 1] + nrm[k + 1], P[k + 1] - nrm[k + 1], P[k] - nrm[k]])
-        cv2.fillConvexPoly(img, np.round(q * 16).astype(np.int32), color, cv2.LINE_AA, shift=4)
-    for k in range(len(P)):
+    nrm = np.stack([-tang[:, 1], tang[:, 0]], 1) * (w[:, None] / 2)
+    if closed:
+        for k in range(len(P) - 1):
+            q = np.array([P[k] + nrm[k], P[k + 1] + nrm[k + 1], P[k + 1] - nrm[k + 1], P[k] - nrm[k]])
+            cv2.fillConvexPoly(img, np.round(q * 16).astype(np.int32), color, cv2.LINE_AA, shift=4)
+        joins = np.arange(len(P))
+    else:
+        poly = np.concatenate([P + nrm, (P - nrm)[::-1]])
+        cv2.fillPoly(img, [np.round(poly * 16).astype(np.int32)], color, cv2.LINE_AA, shift=4)
+        # where the half width exceeds the local radius of curvature the inner offset folds over
+        # (even-odd fill would leave a notch): patch those points with discs
+        seg = np.linalg.norm(np.diff(P, axis=0), axis=1)
+        turn = np.zeros(len(P))
+        turn[1:-1] = np.arccos(np.clip((tang[:-2] * tang[2:]).sum(1), -1, 1)) / 2
+        step = np.r_[seg[:1], 0.5 * (seg[:-1] + seg[1:]), seg[-1:]]
+        joins = np.r_[0, np.where(turn * w / 2 > 0.5 * step)[0], len(P) - 1]
+    for k in np.unique(joins):
         r = w[k] / 2
         if r > 0.6:
             cv2.circle(img, tuple(np.round(P[k] * 16).astype(int)), int(round(r * 16)), color, -1,

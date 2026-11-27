@@ -271,9 +271,12 @@ class Physics:
         return out
 
 
-def choose_contacts(X, valid, height, down=np.array([0.0, 1.0, 0.0]), dynamic=False):
+def choose_contacts(X, valid, height, down=np.array([0.0, 1.0, 0.0]), dynamic=False, prev=None, leave=0.08):
     """Foot points near the floor; in static mode both feet are assumed planted when the higher
-    foot is within 15 cm (a noisy fit often leaves a planted foot hovering)."""
+    foot is within 15 cm (a noisy fit often leaves a planted foot hovering).
+    prev (video): hysteresis. A point that was a contact in the previous frame stays one while it
+    is within `leave` m of the floor; new points still have to meet the entry rule above. Without
+    it a foot hovering near the threshold switches contact on and off from frame to frame."""
     tol = max(0.04, 0.025 * height)
     h = -(X @ down)
     lowest = {s: min(h[IDX[p]] for p in pts if valid[IDX[p]]) for s, pts in FOOT_POINTS.items()
@@ -288,4 +291,6 @@ def choose_contacts(X, valid, height, down=np.array([0.0, 1.0, 0.0]), dynamic=Fa
         if lowest[s] - floor < tol or (not dynamic and lowest[s] - floor < 0.15):
             lo = lowest[s]
             out += [p for p in pts if valid[IDX[p]] and h[IDX[p]] - lo < 0.06]
+    if prev:
+        out += [p for p in prev if p in IDX and p not in out and valid[IDX[p]] and h[IDX[p]] - floor < leave]
     return out

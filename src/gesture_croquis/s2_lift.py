@@ -209,7 +209,7 @@ GROUP_NAMES = ["legs", "arms", "torso"]
 def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
                  w_hinge=1.0, w_depth=1.0, w_prior=1.0, iters=200, tol=1e-4,
                  height_sigma=0.07, prop_sigma=0.10, w_balance=1.0, physics=None, physics_p0=None,
-                 order_cons=None, w_order=1.0, jac="auto", solver="auto", _probe=False):
+                 order_cons=None, w_order=1.0, jac="auto", solver="auto", scales_p0=None, _probe=False):
     """Return (X (J,3) camera-frame metres, valid (J,), info).
     physics: optional biomech.Physics block — adds its residuals (passive muscle, gravity effort,
     balance, floor) and its parameters (camera pitch) to the same least-squares problem.
@@ -293,7 +293,7 @@ def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
     def residuals(p):
         return np.concatenate([r for _, r in residual_groups(p)])
 
-    p0 = np.r_[X0[vi].ravel(), np.zeros(4)]
+    p0 = np.r_[X0[vi].ravel(), np.zeros(4) if scales_p0 is None else np.asarray(scales_p0, float)]
     if use_depth:
         p0 = np.r_[p0, 0.0]
     if physics is not None:
@@ -608,7 +608,7 @@ class Lifter3D:
                  device: str = "auto", dynamic: bool = False, search: bool = True,
                  physical: bool = True, mass: float | None = None, n_physical: int = 2,
                  label_swaps: bool = True, swap_prior: float = 3.0, workers: int | None = None,
-                 occlusion: bool = True, jac: str = "auto", solver: str = "auto"):
+                 occlusion: bool = True, jac: str = "auto", solver: str = "auto", depth_device: str | None = None):
         self.backend, self.height, self.z_sign = backend, height, z_sign
         self.dynamic, self.search = dynamic, search
         self.physical, self.mass, self.n_physical = physical, mass, n_physical
@@ -616,7 +616,8 @@ class Lifter3D:
         self.occlusion = occlusion
         self.phys_tol = 1e-3
         self.fit_kw = dict(w_balance=0.0 if dynamic else 1.0, jac=jac, solver=solver)
-        self.depth = RTMW3DDepth(device) if backend == "rtmw3d" else None
+        # RTMW3D can run on its own device (e.g. CoreML) while S1 stays on the CPU
+        self.depth = RTMW3DDepth(depth_device or device) if backend == "rtmw3d" else None
         self.jac = "fd"
         if jac != "fd":
             from . import s2_jax
@@ -632,8 +633,13 @@ class Lifter3D:
                 print("[S2] jax not installed: finite-difference Jacobian (pip install jax for ~10x faster S2)")
 
     # ------------------------------------------------------------------
-    def __call__(self, frame, img_bgr=None, K=None, X_prev=None):
-        """Fill frame.joints3d / valid3d / camera_K / camera_R / s2_info in place and return it."""
+    def __call__(self, frame, img_bgr=None, K=None, X_prev=None, X_track=None, track_sign=None,
+                 track_bonus=0.0, track_scales=None, track_pitch=0.0, contacts_prev=None):
+        """Fill frame.joints3d / valid3d / camera_K / camera_R / s2_info in place and return it.
+        Video keyframes: X_track (the current track, already fitted near this frame) joins the
+        physical refinement as one more candidate, and its energy is discounted by track_bonus
+        (e.g. 0.15) when the winner is picked. A full re-solve then replaces the track only when it
+        is clearly better: hysteresis against flipping between two near-equal readings."""
         t0 = time.perf_counter()
         K = default_K(frame.img_hw) if K is None else K
         k2, c = frame.kpts2d.astype(np.float64), frame.conf.copy()
@@ -680,16 +686,27 @@ class Lifter3D:
                 cd.update(hyp=hname, swap=sw, k2=k2h, c=ch, z=zh, zc=zch, cons=cons)
                 pool.append(cd)
 
+        self._contacts_prev = contacts_prev
         if self.physical:
             # refine the best candidates of EVERY label hypothesis (so each gets a fair chance)
             sel = []
             for hname, _ in hyps:
                 mine = sorted((cd for cd in pool if cd["hyp"] == hname), key=lambda cd: cd["pre"])
                 sel += mine[:self.n_physical]
+            if X_track is not None:                  # the current video track, as one more candidate
+                k2h, ch, zh, zch = data[hyps[0][0]]
+                base = next(cd for cd in pool if cd["hyp"] == hyps[0][0])
+                sel.append(dict(X=np.asarray(X_track, float), v=ch > CONF_MIN, info={}, flips={}, src="track",
+                                pre=0.0, hyp=hyps[0][0], swap=hyps[0][1], k2=k2h, c=ch, z=zh, zc=zch,
+                                cons=base.get("cons"), scales_p0=track_scales, pitch_p0=track_pitch,
+                                sign=track_sign if track_sign else (base["sign"] or 1)))
             phys = self._physical_batch(sel, K)
             for cd in phys:                          # detector labels are usually right: a swap
                 if cd["swap"]:                       # must be clearly better to win
                     cd["cost"] += self.swap_prior
+                cd["cost_raw"] = cd["cost"]
+                if cd["src"].startswith("track"):    # hysteresis: the track keeps its place unless
+                    cd["cost"] *= (1.0 - track_bonus)   # a re-solve beats it by track_bonus
             phys.sort(key=lambda cd: cd["cost"])
             win, ranking = phys[0], phys
         else:
@@ -709,7 +726,8 @@ class Lifter3D:
                    subject_distance_m=float(X[IDX["pelvis"], 2]),
                    candidates=[dict(hyp=cd["hyp"], sign=cd["sign"], src=cd["src"],
                                     flips={g: list(m) for g, m in cd["flips"].items()},
-                                    energy=round(cd.get("cost", cd["pre"]), 2)) for cd in ranking[:8]],
+                                    energy=round(cd.get("cost_raw", cd.get("cost", cd["pre"])), 2))
+                               for cd in ranking[:8]],
                    s2_ms=1e3 * (time.perf_counter() - t0))
         if len(ranking) > 1:
             e0 = ranking[0].get("cost", ranking[0]["pre"]); e1 = ranking[1].get("cost", ranking[1]["pre"])
@@ -717,6 +735,9 @@ class Lifter3D:
         info.update(inf)
 
         frame.kpts2d, frame.conf = win["k2"].astype(np.float32), win["c"]
+        return self._write_frame(frame, X, v, K, info)
+
+    def _write_frame(self, frame, X, v, K, info):
         frame.joints3d, frame.valid3d, frame.camera_K = X, v, K
         if info.get("physics_p"):
             ph = info["physics_p"][0]                      # fitted camera pitch: level the world
@@ -728,6 +749,30 @@ class Lifter3D:
         info.update(spine_lateral_bend_deg=sp["lateral_bend_deg"], spine_twist_deg=sp["twist_deg"],
                     spine_note="interpolated from torso box")
         return frame
+
+    def track(self, frame, K, X_prev, scales_p0=None, pitch=0.0, contacts_prev=None, order_cons=None,
+              iters=60):
+        """Video, between keyframes: ONE physical fit warm-started from the previous frame's
+        skeleton (and its height / proportions / camera pitch). No detector, no RTMW3D, no label
+        or depth-flip search: a pose moves little between frames, so the previous solution is the
+        best start. Contacts carry over with hysteresis (choose_contacts(prev=...)); occlusion
+        order constraints from the last keyframe can be passed in (they depend on joints only).
+        The same physical objective as __call__ minus the depth cue, so costs of two tracked
+        fits of one frame are comparable."""
+        t0 = time.perf_counter()
+        k2, c = frame.kpts2d.astype(np.float64), frame.conf.copy()
+        valid = c > CONF_MIN
+        from .biomech import Physics, choose_contacts
+        contacts = choose_contacts(X_prev, valid, self.height, dynamic=self.dynamic, prev=contacts_prev)
+        ph = Physics(contacts, self.height, mass=self.mass, dynamic=self.dynamic)
+        X, v, inf = fit_skeleton(kpts2d=k2, conf=c, K=K, height=self.height, X0=X_prev, physics=ph,
+                                 physics_p0=np.array([pitch]), scales_p0=scales_p0, tol=self.phys_tol,
+                                 iters=iters, order_cons=order_cons or None, **self.fit_kw)
+        reproj = np.linalg.norm(project(X[v], K) - k2[v], axis=1)
+        inf.update(contacts=contacts, init="track", z_sign=None, label_hypothesis="tracked", flips={},
+                   reproj_px_median=float(np.median(reproj)), reproj_px_max=float(reproj.max()),
+                   s2_ms=1e3 * (time.perf_counter() - t0))
+        return self._write_frame(frame, X, v, K, inf)
 
     # ------------------------------------------------------------------
     def _fit_jobs(self, k2, c, K, z, zc, X_prev=None):
@@ -775,11 +820,17 @@ class Lifter3D:
         jobs = []
         for cd in cands:
             zr = None if cd["z"] is None else (cd["sign"] or 1) * cd["z"]
-            cd["contacts"] = choose_contacts(cd["X"], cd["v"], self.height, dynamic=self.dynamic)
+            cd["contacts"] = choose_contacts(cd["X"], cd["v"], self.height, dynamic=self.dynamic,
+                                             prev=getattr(self, "_contacts_prev", None))
             ph = Physics(cd["contacts"], self.height, mass=self.mass, dynamic=self.dynamic)
+            extra = {}
+            if cd.get("scales_p0") is not None:
+                extra["scales_p0"] = cd["scales_p0"]
+            if cd.get("pitch_p0") is not None:
+                extra["physics_p0"] = np.array([cd["pitch_p0"]])
             jobs.append(dict(kpts2d=cd["k2"], conf=cd["c"], K=K, height=self.height, X0=cd["X"], z_rel=zr,
                              z_conf=cd["zc"], physics=ph, tol=self.phys_tol, iters=120,
-                             order_cons=cd.get("cons"), **self.fit_kw))
+                             order_cons=cd.get("cons"), **extra, **self.fit_kw))
         out = []
         for cd, (X, v, inf) in zip(cands, run_fits(jobs, self.workers)):
             inf["contacts"] = cd["contacts"]

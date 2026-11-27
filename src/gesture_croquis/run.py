@@ -38,15 +38,17 @@ class Pipeline:
     def __init__(self, s1="halpe26", mode="balanced", s2="rtmw3d", height=1.70, device="cpu",
                  z_sign="auto", s3=True, mass=None, contacts=None, sagittal=0.0, dynamic=False,
                  search=True, physical=True, label_swaps=True, workers=None, occlusion=True, jac="auto",
-                 solver="auto"):
+                 solver="auto", depth_device=None):
         from .s1_keypoints import RTMPose2D
         t = time.perf_counter()
         self.s1 = RTMPose2D(s1, mode=mode, device=device)
         self.s2 = Lifter3D(s2, height=height, z_sign=z_sign, device=device, dynamic=dynamic, search=search,
                            physical=physical, mass=mass, label_swaps=label_swaps, workers=workers,
-                           occlusion=occlusion, jac=jac, solver=solver)
+                           occlusion=occlusion, jac=jac, solver=solver, depth_device=depth_device)
         self.s3 = dict(body_mass=mass, contacts=contacts, sagittal=sagittal) if s3 else None
-        print(f"[init] models ready in {time.perf_counter() - t:.1f}s  (S1 device: {self.s1.device})")
+        dd = getattr(self.s2.depth, "dev", None)
+        print(f"[init] models ready in {time.perf_counter() - t:.1f}s  (S1 device: {self.s1.device}"
+              + (f", RTMW3D device: {dd})" if dd else ")"))
 
     def __call__(self, img_bgr, K=None):
         r = self.s1(img_bgr)
@@ -193,6 +195,9 @@ def main():
     ap.add_argument("--z-sign", default="auto", choices=["auto", "+", "-"],
                     help="RTMW3D depth sign: 'auto' (default) fits both and keeps the better; '+'/'-' fixes it "
                          "(half the fits, but a wrong sign mirrors the whole pose in depth)")
+    ap.add_argument("--depth-device", default=None,
+                    help="device for the RTMW3D depth model only (default: same as --device). Try 'mps' "
+                         "(CoreML): RTMW3D-x is ~0.22 s on the CPU. Falls back to CPU if CoreML rejects it")
     ap.add_argument("--jac", default="auto", choices=["auto", "jax", "fd"],
                     help="S2 Jacobian: exact via JAX (auto, if installed) or finite differences (fd, slow)")
     ap.add_argument("--device", default="cpu",
@@ -244,7 +249,7 @@ def main():
                     mass=a.mass, contacts=contacts, sagittal=a.sagittal, dynamic=a.dynamic,
                     search=not a.no_search, physical=not a.no_physical,
                     label_swaps=not a.no_label_swaps, workers=a.workers, occlusion=not a.no_occlusion,
-                    jac=a.jac, solver=a.solver)
+                    jac=a.jac, solver=a.solver, depth_device=a.depth_device)
     print(f"[init] total {1e3 * (time.perf_counter() - t_init):.0f} ms (model loading, not counted per image)")
     for p in paths:
         t_img = time.perf_counter()

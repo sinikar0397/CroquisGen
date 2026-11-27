@@ -120,3 +120,14 @@ def test_layers_json_and_render(tmp_path):
     img = render_preview(c, (400, 300))
     assert img.shape == (400, 300, 3) and img.min() < 100                # something was drawn
     assert preview_panel(c, np.full((960, 1280, 3), 200, np.uint8), 300).shape[0] == 300
+
+
+def test_batched_curve_fit_equals_single():
+    """All line-of-action candidates fitted in one pass = each fitted alone."""
+    from gesture_croquis.s4_gesture import fit_cubic_bezier_batch
+    rng = np.random.default_rng(0)
+    curves = [bezier(rng.normal(0, 50, (4, 2)), 64) + rng.normal(0, 1.0, (64, 2)) for _ in range(7)]
+    CT, RS = fit_cubic_bezier_batch(np.stack(curves))
+    for c, ct, rs in zip(curves, CT, RS):
+        ctrl, resid = fit_cubic_bezier(c)
+        assert np.allclose(ct, ctrl, atol=1e-9) and abs(rs - resid) < 1e-12

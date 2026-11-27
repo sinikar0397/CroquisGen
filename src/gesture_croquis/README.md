@@ -85,6 +85,7 @@ On the first run rtmlib downloads the ONNX weights (~300 MB total) into `~/.cach
 | `--views` | `0` | S4 views, `yaw[:pitch]` list in degrees: `0,90,-45:20` (0 = photo camera) |
 | `--layers` | `AB` | S4 layers: A line of action, B gesture/rhythm, C construction volumes |
 | `--exaggeration` | `0.35` | how far the line of action is pushed off its chord (0.2–0.5) |
+| `--depth-device` | same as `--device` | device for the RTMW3D depth model only, e.g. `mps` (CoreML) while S1 stays on the CPU. RTMW3D-x takes ~0.22 s on the CPU; it falls back to the CPU if CoreML rejects it |
 | `--device` | `cpu` | `mps` = CoreML EP; falls back to CPU automatically if CoreML rejects the model |
 
 ## S2 speed: exact Jacobian (`s2_jax.py`)
@@ -274,7 +275,9 @@ Output: `<stem>_croquis[<view>].json` holds the strokes in view pixels with per-
 - **front / behind:** where two layer-B strokes cross (excluding end-to-end touches and strokes of the same group), the one more than 3 cm nearer gets an accent and the farther one thins to a "lost line". This is the overlap/T-junction cue. The LOA is abstract and takes no part.
 - All weights are in `S4Params`.
 
-**Preview.** `render_preview` and `preview_panel` draw quads with round joins at 2× supersampling. The line of action is drawn in red (`LOA_COLOR`), even when `color=` recolours the other strokes. Pass `loa_color=None` for one colour throughout. This is a stand-in for S5 (skia/pycairo, SVG per layer), which can consume the JSON strokes as they are.
+**Preview.** `render_preview` and `preview_panel` draw each open stroke as one outline polygon with round end caps, adding discs only where a sharp bend could fold the outline. Closed strokes (head, construction ellipses) are drawn as quads with round joins. Default is 2× supersampling. The line of action is drawn in red (`LOA_COLOR`), even when `color=` recolours the other strokes. Pass `loa_color=None` for one colour throughout. This is a stand-in for S5 (skia/pycairo, SVG per layer), which can consume the JSON strokes as they are.
+
+**Speed.** All line-of-action candidates and limb curves are fitted in one vectorised pass (`fit_cubic_bezier_batch`), with the nearest-point search done as a BLAS matrix product; the results are identical to fitting one curve at a time. Measured on `e3020084…` keypoints (2D mode, as the live app uses): build 46 → 17 ms, 720p render 10 → 4 ms, a whole live frame about 55 → 24 ms.
 
 **Not yet:** the learned stroke stylisation, velocity/follow-through cues for airborne poses (`info.airborne` and `com_offset_m` are passed through for that), and a sagittal torso squash beyond what the muscle lengths give.
 
@@ -287,6 +290,39 @@ Tests (`test_s4_gesture.py`, synthetic poses):
 - yaw 360 equals the photo view, and novel views are finite;
 - overlap thins the stroke behind;
 - the 2D fallback, layer selection, JSON and the renderer.
+
+## Live video: S1–S4 with ROI tracking and hysteresis (`live.py`)
+`LivePipeline.process(frame_bgr) -> LiveResult(frame, croquis, kind, detected, timings)`, one instance per stream. CLI:
+```bash
+python -m gesture_croquis.live --camera 0 --show
+python -m gesture_croquis.live --video clip.mp4 --out croquis.mp4 --overlay
+```
+**S1, ROI tracking.**
+- The person detector (YOLOX) runs only without a track, after the track is lost, or every `redetect_every` frames (90) as a safety net. Otherwise RTMPose runs on a box grown 25% around the previous frame's confident keypoints, and by another 50% when a joint comes near the box edge.
+- **"Lost" has hysteresis:** the core-joint confidence must stay below 0.30 for two frames to count as lost, and rise above 0.45 to count as found.
+- A One-Euro filter on the keypoints removes jitter without lagging fast motion.
+
+**S2, tracking.** `Lifter3D.track()` runs one physical fit warm-started from the previous frame's skeleton, fitted height and proportions (`fit_skeleton(scales_p0=...)`) and camera pitch. No detector, no RTMW3D, no label or flip search.
+- **Contact hysteresis** (`choose_contacts(prev=...)`): a foot in contact stays in contact until it is 8 cm above the floor; new contacts still need the usual entry rule.
+
+**S2, keyframes.**
+- **When:** every `keyframe_every` frames (30), after re-detection, or when the tracked fit degrades. "Degrades" means a median 2D error above 12 px, one joint more than 48 px off, or the energy jumping ×2.5 from one frame to the next. The energy *level* is not a trigger, because a harder pose (sinking into a lunge) raises it legitimately.
+- **How:** the full re-solve (RTMW3D depth, both depth signs, label swaps, flip search) runs in a separate worker **process**. In a thread it shared Python's global interpreter lock with the frame loop: p95 frame time 302 ms, against 95–100 ms in a process. RTMW3D loads only in the worker.
+- **Hysteresis:** the current track joins the re-solve as a candidate, with its energy discounted by `track_bonus` (15%). When the result arrives, a winner that isn't the track is re-fitted to the *current* frame. It replaces the track only if it beats the track there by 15% as well. Two nearly equal readings therefore do not flip back and forth.
+- Without `track_bonus`, the synthetic test sequence switched twice, with a worst jump of 14 cm between frames; with it, never.
+- Because the worker re-imports the calling script, that script needs an `if __name__ == "__main__":` guard. `LiveConfig(async_keyframes=False)` runs keyframes in the frame loop instead, with stalls.
+
+**S3 and S4** run on every frame. The line-of-action chain has hysteresis too (`S4Params.loa_hysteresis`, 15%; `build_croquis(prefer_loa=...)`).
+
+**Measured** in my workspace (Linux, CPU) on a synthetic 120-frame clip: standing ↔ lunge, turning ±50°, 2 px keypoint noise, with an RTMPose stand-in that loses joints outside a too-tight ROI.
+- **Detector:** 2 of 120 frames.
+- **Per frame:** S2 tracked ~30 ms, S4 (3D mode) ~24 ms, S3 ~5 ms. Median ~60 ms, p95 ~95 ms, plus RTMPose on the ROI (about 22 ms on an M-series CPU). The first frame waits for a full solve (~0.4 s, plus ~5 s the first time the worker compiles).
+- **Smoothness:** fitted joints move as much as the truth between frames (1.19 cm median), and accuracy matches per-photo S2 (8 cm median joint error after alignment).
+
+**Not covered yet:**
+- Occlusion constraints are computed on keyframes only and not carried into the track.
+- One person per stream.
+- The app's `renderer.py` still feeds MediaPipe landmarks to S4 in 2D mode and is declared `stateless`. Switching it to `LivePipeline` needs the camera frames and one long-lived pipeline instance in the app loop.
 
 ## Known limits / next steps
 * **Speed:** S1 should be real-time-capable. S2 currently takes about 250–600 ms per fit (finite-difference Jacobian); `auto` z-sign × two starts means 4 fits. For webcam use: warm-start from the previous frame, fix the sign, write an analytic Jacobian, and re-detect the bbox every N frames only.
