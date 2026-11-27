@@ -178,8 +178,24 @@ def _support_basis(down):
 class Physics:
     """Extra residual block + parameters (camera pitch) for fit_skeleton."""
 
-    def __init__(self, contacts, height, mass=None, dynamic=False, w=None):
+    def __init__(self, contacts, height, mass=None, dynamic=False, w=None, floor_h=None, g_scale=1.0,
+                 pitch_ref=0.0, pitch_sigma_deg=8.0, anchor=None):
+        """floor_h (video): tracked floor height along "up" (m, camera centre = 0). Planted contacts
+        are then pulled onto THAT plane instead of only onto a common one, also in dynamic mode.
+        g_scale: effective gravity in the body's frame, as a fraction of g (d'Alembert:
+        g_eff = g - a_com). 1 = standing / quasi-static, 0 = flight (free fall: gravity loads no
+        joint, every segment accelerates with it).
+        pitch_ref / pitch_sigma_deg: camera pitch prior (photo: 0 +- 8 deg; video tracking: the
+        previous frame's pitch +- 1 deg, so a jump cannot be explained away by tilting gravity)."""
+        self.pitch_ref, self.pitch_sigma = float(pitch_ref), float(pitch_sigma_deg)
+        # anchor (n_contacts, 3): stance. Planted contacts keep their HORIZONTAL position (sigma
+        # 2 cm, perpendicular to gravity): a planted foot does not slide. Without it a fit could
+        # keep a rising foot "on the floor" by sliding it away from the camera (a floor point
+        # further away projects higher), which hid small hops from the flight test.
+        self.anchor = None if anchor is None else np.asarray(anchor, float).reshape(-1, 3)
         self.contacts = list(contacts)
+        self.floor_h = None if floor_h is None else float(floor_h)
+        self.g_scale = float(g_scale)
         self.ci = np.array([IDX[c] for c in self.contacts], int)
         self.height = height
         self.mass = mass or 22.0 * height ** 2
@@ -187,7 +203,10 @@ class Physics:
         # stress: unified muscle effort-stress (gravity demand + length state, muscles.py)
         # passive: relaxed-posture prior (statistical naturalness; also covers axial rotations)
         self.w = dict(passive=0.7, stress=3.0, balance=0.0 if dynamic else 1.0,
-                      floor=0.0 if dynamic else 1.0, pitch=1.0)
+                      floor=0.0 if dynamic else 1.0, pitch=1.0,
+                      stance=1.0 if anchor is not None else 0.0)
+        if self.floor_h is not None:
+            self.w["floor"] = max(self.w["floor"], 0.5)     # sigma 5 cm to the tracked plane
         if w:
             self.w.update(w)
         owner = [_CONTACT_OWNER.get(c, "lower_trunk") for c in self.contacts]
@@ -217,8 +236,9 @@ class Physics:
             cop = w @ C
         else:
             C, w, cop = np.zeros((0, 3)), np.zeros(0), com
-        Fg = np.outer(m * G, down)                                   # gravity, down
-        Fc = -np.outer(w * m.sum() * G, down)                        # reactions, up
+        g = G * self.g_scale
+        Fg = np.outer(m * g, down)                                   # gravity, down
+        Fc = -np.outer(w * m.sum() * g, down)                        # reactions, up
         cg = np.cross(P, Fg); cc = np.cross(C, Fc) if len(C) else np.zeros((0, 3))
         Jx = X[_EJ]
         Fsum = _MASK_SEG @ Fg + (self.mask_c @ Fc if len(C) else 0)
@@ -239,8 +259,13 @@ class Physics:
             off = (com - cop) - ((com - cop) @ down) * down
             res.append(self.w["balance"] * np.array([np.sqrt(off @ off) / 0.04]))
             h = -(X[self.ci] @ down)                                   # heights along "up"
-            res.append(self.w["floor"] * (h - h.mean()) / 0.025)
-        res.append(self.w["pitch"] * np.array([np.degrees(pitch) / 8.0]))
+            ref = h.mean() if self.floor_h is None else self.floor_h
+            res.append(self.w["floor"] * (h - ref) / 0.025)
+        res.append(self.w["pitch"] * np.array([np.degrees(pitch - self.pitch_ref) / self.pitch_sigma]))
+        if self.anchor is not None and len(self.ci) and self.w["stance"]:
+            e1, e2 = _support_basis(down)
+            d = X[self.ci] - self.anchor
+            res.append(self.w["stance"] * np.c_[d @ e1, d @ e2].ravel() / 0.02)
         return np.concatenate(res)
 
     def breakdown(self, X, p):
@@ -259,7 +284,8 @@ class Physics:
         if len(self.ci):
             off = (com - cop) - ((com - cop) @ down) * down
             h = -(X[self.ci] @ down)
-            out.update(balance=float((np.sqrt(off @ off) / 0.04) ** 2), floor=float((((h - h.mean()) / 0.025) ** 2).sum()))
+            ref = h.mean() if self.floor_h is None else self.floor_h
+            out.update(balance=float((np.sqrt(off @ off) / 0.04) ** 2), floor=float((((h - ref) / 0.025) ** 2).sum()))
         names = [k for k in ang]
         dev = {}
         for k, r in zip(names, pr):
@@ -271,19 +297,28 @@ class Physics:
         return out
 
 
-def choose_contacts(X, valid, height, down=np.array([0.0, 1.0, 0.0]), dynamic=False, prev=None, leave=0.08):
+def foot_heights(X, valid, down):
+    """Height (along "up", m) of each visible foot's lowest point: {"l": h, "r": h}."""
+    h = -(np.asarray(X, float) @ down)
+    return {s: float(min(h[IDX[p]] for p in pts if valid[IDX[p]])) for s, pts in FOOT_POINTS.items()
+            if any(valid[IDX[p]] for p in pts)}
+
+
+def choose_contacts(X, valid, height, down=np.array([0.0, 1.0, 0.0]), dynamic=False, prev=None, leave=0.08,
+                    floor_h=None):
     """Foot points near the floor; in static mode both feet are assumed planted when the higher
     foot is within 15 cm (a noisy fit often leaves a planted foot hovering).
     prev (video): hysteresis. A point that was a contact in the previous frame stays one while it
     is within `leave` m of the floor; new points still have to meet the entry rule above. Without
-    it a foot hovering near the threshold switches contact on and off from frame to frame."""
+    it a foot hovering near the threshold switches contact on and off from frame to frame.
+    floor_h (video, dynamic): the TRACKED floor height. Feet are judged against it instead of
+    against the lowest foot, so when both feet are above it (a jump) the result is [] (flight)."""
     tol = max(0.04, 0.025 * height)
     h = -(X @ down)
-    lowest = {s: min(h[IDX[p]] for p in pts if valid[IDX[p]]) for s, pts in FOOT_POINTS.items()
-              if any(valid[IDX[p]] for p in pts)}
+    lowest = foot_heights(X, valid, down)
     if not lowest:
         return []
-    floor = min(lowest.values())
+    floor = min(lowest.values()) if floor_h is None else float(floor_h)
     out = []
     for s, pts in FOOT_POINTS.items():
         if s not in lowest:

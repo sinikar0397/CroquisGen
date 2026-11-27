@@ -39,10 +39,16 @@ class RTMPose2D:
     """Wraps rtmlib's YOLOX detector + RTMPose top-down estimator."""
 
     def __init__(self, model: str = "halpe26", mode: str = "balanced",
-                 device: str = "auto", backend: str = "onnxruntime"):
+                 device: str = "auto", backend: str = "onnxruntime", det_mode: str | None = None):
+        """det_mode: a different rtmlib mode for the person detector only (e.g. "lightweight" =
+        YOLOX-tiny while RTMPose stays at `mode`). Video uses it: the detector runs rarely there,
+        but when it does it is on the frames with the fastest motion."""
         import rtmlib
         cls_name, self.layout = MODELS[model]
-        cfg = getattr(rtmlib, cls_name).MODE[mode]
+        cfg = dict(getattr(rtmlib, cls_name).MODE[mode])
+        if det_mode and det_mode != mode:
+            dcfg = getattr(rtmlib, cls_name).MODE[det_mode]
+            cfg["det"], cfg["det_input_size"] = dcfg["det"], dcfg["det_input_size"]
         self.device = pick_device(device)
         self.mode = mode
         self._rtmlib, self._cfg, self._backend = rtmlib, cfg, backend

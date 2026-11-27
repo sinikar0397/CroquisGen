@@ -52,8 +52,19 @@ def exif_focal_35mm(path: str) -> float | None:
         return None
 
 
+Z_NEAR = 0.10          # m: smooth depth floor for projection
+
+
+def zfloor(z):
+    """Smooth max(z, Z_NEAR): equal to z beyond ~0.4 m; below, it bends to Z_NEAR with a
+    non-zero slope, so the fit can push a joint that drifted toward the camera back out."""
+    s = 0.05
+    t = (np.asarray(z, float) - Z_NEAR) / s
+    return Z_NEAR + s * np.where(t > 30, t, np.log1p(np.exp(np.minimum(t, 30))))
+
+
 def project(X, K):
-    z = np.maximum(X[:, 2:3], 1e-3)
+    z = zfloor(X[:, 2:3])
     return (X[:, :2] / z) * K[[0, 1], [0, 1]] + K[:2, 2]
 
 
@@ -209,7 +220,8 @@ GROUP_NAMES = ["legs", "arms", "torso"]
 def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
                  w_hinge=1.0, w_depth=1.0, w_prior=1.0, iters=200, tol=1e-4,
                  height_sigma=0.07, prop_sigma=0.10, w_balance=1.0, physics=None, physics_p0=None,
-                 order_cons=None, w_order=1.0, jac="auto", solver="auto", scales_p0=None, _probe=False):
+                 order_cons=None, w_order=1.0, jac="auto", solver="auto", scales_p0=None, lm_opts=None,
+                 _probe=False):
     """Return (X (J,3) camera-frame metres, valid (J,), info).
     physics: optional biomech.Physics block — adds its residuals (passive muscle, gravity effort,
     balance, floor) and its parameters (camera pitch) to the same least-squares problem.
@@ -324,7 +336,7 @@ def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
     if jac_used == "jax" and solver in ("auto", "lm"):
         from types import SimpleNamespace
         px, cost, nfev, njev, status = s2_jax.lm_solve(fun, jac_fn, p0, C=3.0, max_nfev=iters,
-                                                       ftol=tol, xtol=1e-7, gtol=tol)
+                                                       ftol=tol, xtol=1e-7, gtol=tol, **(lm_opts or {}))
         sol = SimpleNamespace(x=px, cost=cost, nfev=nfev, njev=njev, status=status)
         jac_used = "jax-lm"
     else:
@@ -335,6 +347,7 @@ def fit_skeleton(kpts2d, conf, K, height=1.70, X0=None, z_rel=None, z_conf=None,
     Lf = np.linalg.norm(X[bi[:, 0]] - X[bi[:, 1]], axis=1)
     bL = bL * np.exp(log_h + g[bg])
     info = dict(cost=float(sol.cost), nfev=int(sol.nfev), njev=int(sol.njev or 0), jac=jac_used,
+                lm_status=int(sol.status),
                 fit_ms=1e3 * (time.perf_counter() - t0),
                 reproj_px_median=float(np.median(reproj)), reproj_px_max=float(reproj.max()),
                 bone_err_pct_median=float(np.median(np.abs(Lf - bL) / bL) * 100),
@@ -634,7 +647,7 @@ class Lifter3D:
 
     # ------------------------------------------------------------------
     def __call__(self, frame, img_bgr=None, K=None, X_prev=None, X_track=None, track_sign=None,
-                 track_bonus=0.0, track_scales=None, track_pitch=0.0, contacts_prev=None):
+                 track_bonus=0.0, track_scales=None, track_pitch=0.0, contacts_prev=None, floor_h=None):
         """Fill frame.joints3d / valid3d / camera_K / camera_R / s2_info in place and return it.
         Video keyframes: X_track (the current track, already fitted near this frame) joins the
         physical refinement as one more candidate, and its energy is discounted by track_bonus
@@ -687,6 +700,7 @@ class Lifter3D:
                 pool.append(cd)
 
         self._contacts_prev = contacts_prev
+        self._floor_h = floor_h if self.dynamic else None
         if self.physical:
             # refine the best candidates of EVERY label hypothesis (so each gets a fair chance)
             sel = []
@@ -751,25 +765,86 @@ class Lifter3D:
         return frame
 
     def track(self, frame, K, X_prev, scales_p0=None, pitch=0.0, contacts_prev=None, order_cons=None,
-              iters=60):
+              iters=60, floor_h=None, lm_opts=None, flight_reproj_frac=0.02, floor_plane=False,
+              pitch_sigma_deg=1.0, floor_pitch=None, floor_pitch_sigma_deg=0.5, lift_m=0.08):
         """Video, between keyframes: ONE physical fit warm-started from the previous frame's
         skeleton (and its height / proportions / camera pitch). No detector, no RTMW3D, no label
         or depth-flip search: a pose moves little between frames, so the previous solution is the
         best start. Contacts carry over with hysteresis (choose_contacts(prev=...)); occlusion
         order constraints from the last keyframe can be passed in (they depend on joints only).
         The same physical objective as __call__ minus the depth cue, so costs of two tracked
-        fits of one frame are comparable."""
+        fits of one frame are comparable.
+        floor_h (dynamic mode): tracked floor height (live.FloorTracker). Contacts are judged
+        against it; with no foot on it the frame is flight: no contacts and no gravity load.
+        lm_opts: early-stop options for s2_jax.lm_solve (max_rejects, stall_tol).
+        Flight needs evidence: monocularly, a foot raised and a foot further back on the floor can
+        project alike, and a fit without the floor constraint lets feet float, which would keep
+        a false flight going. So when both feet of the warm start are off the tracked floor, the
+        GROUNDED reading (lowest foot planted on the floor) is fitted first; flight is accepted
+        only if that fit cannot match the 2D keypoints (median reprojection error above
+        flight_reproj_frac of the person's height in px): for a real jump, a body whose size in
+        the image fixes its distance cannot reach the floor.
+        floor_plane: also pull planted feet onto the tracked plane (Physics.floor_h). Off by
+        default: the floor's height in camera coordinates scales with the fitted distance, which
+        monocularly comes only from the body-height prior, so the tracked value drifts with it and
+        pinning feet to it cost accuracy (synthetic lunge: 0.078 -> 0.107 m). It is used to decide
+        contact / flight only."""
         t0 = time.perf_counter()
         k2, c = frame.kpts2d.astype(np.float64), frame.conf.copy()
         valid = c > CONF_MIN
-        from .biomech import Physics, choose_contacts
-        contacts = choose_contacts(X_prev, valid, self.height, dynamic=self.dynamic, prev=contacts_prev)
-        ph = Physics(contacts, self.height, mass=self.mass, dynamic=self.dynamic)
-        X, v, inf = fit_skeleton(kpts2d=k2, conf=c, K=K, height=self.height, X0=X_prev, physics=ph,
-                                 physics_p0=np.array([pitch]), scales_p0=scales_p0, tol=self.phys_tol,
-                                 iters=iters, order_cons=order_cons or None, **self.fit_kw)
+        from .biomech import Physics, choose_contacts, gravity_dir
+        fl = floor_h if self.dynamic else None
+        fp = pitch if floor_pitch is None else floor_pitch   # the tracked floor is a plane: height + tilt
+        # lift_m: how far above the floor a planted foot must rise to count as lifted (and the
+        # grounded test's gap threshold). live.FloorTracker sets it from the measured noise of
+        # planted-foot heights: a steady fit detects small hops, a noisy one does not flicker.
+        contacts = choose_contacts(X_prev, valid, self.height, down=gravity_dir(fp if fl is not None else pitch),
+                                   dynamic=self.dynamic, prev=contacts_prev, floor_h=fl,
+                                   leave=lift_m if fl is not None else 0.08)
+        def fit(cs, air, plane=floor_plane, opts=lm_opts, p_ref=pitch, p_sig=pitch_sigma_deg, stance=False):
+            anchor = np.asarray(X_prev, float)[[IDX[p] for p in cs]] if (stance and cs) else None
+            ph = Physics(cs, self.height, mass=self.mass, dynamic=self.dynamic,
+                         floor_h=fl if (cs and plane) else None, g_scale=0.0 if air else 1.0,
+                         pitch_ref=p_ref, pitch_sigma_deg=p_sig, anchor=anchor)
+            return ph, fit_skeleton(kpts2d=k2, conf=c, K=K, height=self.height, X0=X_prev, physics=ph,
+                                    physics_p0=np.array([pitch]), scales_p0=scales_p0, tol=self.phys_tol,
+                                    iters=iters, order_cons=order_cons or None, lm_opts=opts, **self.fit_kw)
+
+        airborne, flight_test = False, None
+        if fl is not None and not contacts:            # flight candidate: try the grounded reading first
+            grounded = choose_contacts(X_prev, valid, self.height, down=gravity_dir(fp),
+                                       dynamic=self.dynamic, prev=contacts_prev)
+            # feet PINNED to the tracked floor, full iteration budget (an early stop would leave
+            # the feet where they started and "pass" the test without testing anything)
+            # and the camera tilt held to the FLOOR's (slowly tracked) tilt: otherwise tilting
+            # gravity by d*theta explains a lift of the same size (4.6 deg at 4 m = 0.32 m)
+            # and the planted foot may not slide (stance): it can only go DOWN onto the floor, so a
+            # foot rising in the image can no longer be explained as a foot further back on it
+            ph, (X, v, inf) = fit(grounded, False, plane=True, opts=None, p_ref=fp, p_sig=floor_pitch_sigma_deg,
+                                  stance=True)
+            ok = c > 0.3
+            person = float(np.ptp(k2[ok, 1])) if ok.sum() >= 4 else 0.0
+            e_g = float(np.median(np.linalg.norm(project(X[v], K) - k2[v], axis=1)))
+            from .biomech import foot_heights
+            fh = foot_heights(X, v, gravity_dir(fp))
+            gap = (min(fh.values()) - fl) if fh else 0.0
+            flight_test = dict(grounded_reproj_px=round(e_g, 2), limit_px=round(flight_reproj_frac * person, 2),
+                               grounded_gap_m=round(gap, 3))
+            if e_g > flight_reproj_frac * person or gap > lift_m:   # the floor cannot explain the image: flight
+                airborne = True
+                ph, (X, v, inf) = fit([], True)
+            else:
+                contacts = grounded
+        else:
+            ph, (X, v, inf) = fit(contacts, False)
         reproj = np.linalg.norm(project(X[v], K) - k2[v], axis=1)
-        inf.update(contacts=contacts, init="track", z_sign=None, label_hypothesis="tracked", flips={},
+        if fl is not None:                              # lowest foot above the tracked floor (debug view)
+            from .biomech import foot_heights
+            fh_ = foot_heights(X, v, gravity_dir(fp))
+            inf["foot_gap_m"] = (min(fh_.values()) - fl) if fh_ else None
+            inf["lift_m"] = lift_m
+        inf.update(contacts=contacts, airborne=airborne, floor_h=fl, g_scale=ph.g_scale, flight_test=flight_test,
+                   init="track", z_sign=None, label_hypothesis="tracked", flips={},
                    reproj_px_median=float(np.median(reproj)), reproj_px_max=float(reproj.max()),
                    s2_ms=1e3 * (time.perf_counter() - t0))
         return self._write_frame(frame, X, v, K, inf)
@@ -816,13 +891,21 @@ class Lifter3D:
         return out
 
     def _physical_batch(self, cands, K):
-        from .biomech import Physics, choose_contacts
+        from .biomech import Physics, choose_contacts, gravity_dir
         jobs = []
         for cd in cands:
             zr = None if cd["z"] is None else (cd["sign"] or 1) * cd["z"]
-            cd["contacts"] = choose_contacts(cd["X"], cd["v"], self.height, dynamic=self.dynamic,
-                                             prev=getattr(self, "_contacts_prev", None))
-            ph = Physics(cd["contacts"], self.height, mass=self.mass, dynamic=self.dynamic)
+            fl = getattr(self, "_floor_h", None)
+            pitch0 = cd.get("pitch_p0") or 0.0
+            cd["contacts"] = choose_contacts(cd["X"], cd["v"], self.height, down=gravity_dir(pitch0),
+                                             dynamic=self.dynamic, prev=getattr(self, "_contacts_prev", None),
+                                             floor_h=fl)
+            if fl is not None and not cd["contacts"]:   # keyframes never declare flight (tracking does,
+                cd["contacts"] = choose_contacts(          # with evidence): lowest foot planted, no plane
+                    cd["X"], cd["v"], self.height, down=gravity_dir(pitch0), dynamic=self.dynamic,
+                    prev=getattr(self, "_contacts_prev", None))
+            plane = None                                # see track(floor_plane=...)
+            ph = Physics(cd["contacts"], self.height, mass=self.mass, dynamic=self.dynamic, floor_h=plane)
             extra = {}
             if cd.get("scales_p0") is not None:
                 extra["scales_p0"] = cd["scales_p0"]
@@ -834,6 +917,7 @@ class Lifter3D:
         out = []
         for cd, (X, v, inf) in zip(cands, run_fits(jobs, self.workers)):
             inf["contacts"] = cd["contacts"]
+            inf["airborne"] = False
             out.append(dict(cd, X=X, v=v, info=inf, cost=inf["cost"], src=cd["src"] + "+physical"))
         return out
 

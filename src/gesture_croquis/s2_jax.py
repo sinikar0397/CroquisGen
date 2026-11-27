@@ -89,7 +89,7 @@ def _deg(x):
 
 
 def _project(X, K):
-    z = jnp.maximum(X[:, 2:3], 1e-3)
+    z = 0.10 + 0.05 * jax.nn.softplus((X[:, 2:3] - 0.10) / 0.05)    # = s2_lift.zfloor
     return (X[:, :2] / z) * jnp.stack([K[0, 0], K[1, 1]]) + K[:2, 2]
 
 
@@ -428,7 +428,7 @@ def physics_residuals(X, pitch, s):
     wv = jnp.clip(wv, 0, None) * cm
     wv = wv / jnp.maximum(wv.sum(), 1e-9)
     cop = jnp.where(nc > 0, wv @ C, com)
-    G = BM.G
+    G = BM.G * s["g_scale"]
     Fg = jnp.outer(m * G, down)
     Fc = -jnp.outer(wv * m.sum() * G, down)
     cg = jnp.cross(P, Fg)
@@ -442,8 +442,12 @@ def physics_residuals(X, pitch, s):
     bal = jnp.where(nc > 0, _sqrt0(off @ off) / 0.04, 0.0)
     h = -(C @ down)
     hmean = (h * cm).sum() / jnp.maximum(nc, 1.0)
-    floor = (h - hmean) / 0.025 * cm
-    return [pw[0] * pr, pw[1] * sr, (pw[2] * bal)[None], pw[3] * floor, (pw[4] * _deg(pitch) / 8.0)[None]]
+    ref = s["floor_on"] * s["floor_h"] + (1.0 - s["floor_on"]) * hmean   # tracked floor, else common plane
+    floor = (h - ref) / 0.025 * cm
+    d = (X[s["ci"]] - s["anchor"]) * cm[:, None]
+    stance = jnp.stack([d @ e1, d @ e2], 1).ravel() / 0.02
+    return [pw[0] * pr, pw[1] * sr, (pw[2] * bal)[None], pw[3] * floor,
+            (pw[4] * _deg(pitch - s["pitch_ref"]) / s["pitch_sig"])[None], pw[5] * stance]
 
 
 # ============================================================================ full residual
@@ -519,7 +523,8 @@ def row_mask(spec):
               np.r_[spec["om"], spec["pm"]] * on(spec["w_order"])]
     ph = on(spec["phys_on"])
     blocks += [np.full(n[9], ph), np.full(n[10], ph), np.full(1, ph * (nc > 0) * on(spec["pw"][2])),
-               spec["cmask"] * ph * on(spec["pw"][3]), np.full(1, ph)]
+               spec["cmask"] * ph * on(spec["pw"][3]), np.full(1, ph),
+               np.repeat(spec["cmask"], 2) * ph * on(spec["pw"][5])]
     blocks += [np.full(1, on(spec["w_bal"])), (spec["ew"] != 0) * on(spec["w_depth"]),
                np.full(1, on(spec["use_depth"]))]
     m = np.concatenate([np.asarray(b, float).ravel() for b in blocks])
@@ -666,9 +671,16 @@ def build_spec(kpts2d, conf, K, height, valid, park, sig_px, use_depth, E=None, 
     # physics (padded contacts)
     ci, cm = np.full(MAX_CONTACTS, IDX["pelvis"], np.int32), np.zeros(MAX_CONTACTS)
     mask_c = np.zeros((len(BM.EFFORT_JOINTS), MAX_CONTACTS))
-    pw = np.zeros(5)
+    pw = np.zeros(6)
+    anchor = np.zeros((MAX_CONTACTS, 3))
     mass = 0.0
+    floor_h, floor_on, g_scale, pitch_ref, pitch_sig = 0.0, 0.0, 1.0, 0.0, 8.0
     if physics is not None:
+        pitch_ref = getattr(physics, "pitch_ref", 0.0)
+        pitch_sig = getattr(physics, "pitch_sigma", 8.0)
+        if getattr(physics, "floor_h", None) is not None:
+            floor_h, floor_on = physics.floor_h, 1.0
+        g_scale = getattr(physics, "g_scale", 1.0)
         nci = len(physics.ci)
         if nci > MAX_CONTACTS:
             raise ValueError("too many contacts for s2_jax")
@@ -676,9 +688,13 @@ def build_spec(kpts2d, conf, K, height, valid, park, sig_px, use_depth, E=None, 
         if nci:
             mask_c[:, :nci] = physics.mask_c
         w = physics.w
-        pw = np.array([w["passive"], w["stress"], w["balance"], w["floor"], w["pitch"]], float)
+        pw = np.array([w["passive"], w["stress"], w["balance"], w["floor"], w["pitch"], w.get("stance", 0.0)], float)
+        if getattr(physics, "anchor", None) is not None and nci:
+            anchor[:nci] = physics.anchor
         mass = physics.mass
-    s.update(ci=ci, cmask=cm, mask_c=mask_c, pw=pw, mass=f8(mass), phys_on=f8(1.0 if physics is not None else 0.0))
+    s.update(ci=ci, cmask=cm, mask_c=mask_c, pw=pw, mass=f8(mass), phys_on=f8(1.0 if physics is not None else 0.0),
+             floor_h=f8(floor_h), floor_on=f8(floor_on), g_scale=f8(g_scale),
+             pitch_ref=f8(pitch_ref), pitch_sig=f8(pitch_sig), anchor=anchor)
     return s
 
 
@@ -704,7 +720,8 @@ def make_fun_jac(spec, cols, template):
 
 
 # ============================================================================ #3 Levenberg-Marquardt
-def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4):
+def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4, max_rejects=None,
+             stall_tol=None, stall_steps=3):
     """Robust (soft_l1, scale C) Levenberg-Marquardt around the compiled residual / Jacobian.
 
     Same objective as scipy least_squares(loss="soft_l1", f_scale=C):
@@ -713,12 +730,22 @@ def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4)
     w = rho' + 2 rho'' z. Each step solves the small n x n system (J~'J~ + lam D^2) d = -J~'r~ with
     D = running max of the column norms (SciPy's x_scale="jac"). SciPy's trf instead takes an SVD
     of the full m x n Jacobian at every iteration, which was most of S2 after the exact Jacobian.
-    Returns (p, cost, nfev, njev, status: 1 gtol, 2 ftol, 3 xtol, 0 max_nfev)."""
+    Returns (p, cost, nfev, njev, status: 1 gtol, 2 ftol, 3 xtol, 0 max_nfev, -1 non-finite start
+    (returns p0 with cost inf; the caller must reject the fit), 4 early stop). Never raises on bad
+    numbers.
+    Early stop (video tracking, where the budget matters more than the last 0.1%):
+      max_rejects   stop after this many REJECTED trial steps in a row: the cost would rise
+                    along every direction tried, so more damping only burns residual evaluations
+      stall_tol     stop when the last `stall_steps` accepted steps together lowered the cost by
+                    less than this fraction: creeping along a valley, each step a new Jacobian."""
     C2 = C * C
 
     def cost_of(r):
-        z = r * r / C2
-        return 0.5 * C2 * float(np.sum(2.0 * (np.sqrt(1.0 + z) - 1.0)))
+        # a rejected trial step can overshoot wildly (a joint pushed behind the camera); its cost
+        # is then inf and the step is discarded below, so the overflow is expected, not an error
+        with np.errstate(over="ignore", invalid="ignore"):
+            z = r * r / C2
+            return 0.5 * C2 * float(np.sum(2.0 * (np.sqrt(1.0 + z) - 1.0)))
 
     def scaled(r, Jm):
         z = r * r / C2
@@ -726,12 +753,18 @@ def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4)
         return Jm * sw[:, None], r / np.sqrt(1.0 + z) / sw
 
     p = np.asarray(p0, float).copy()
+    if not np.isfinite(p).all():
+        return p, float("inf"), 0, 0, -1
     r, Jm = fun(p), jac(p)
     cost = cost_of(r)
     nfev = njev = 1
+    if not (np.isfinite(cost) and np.isfinite(Jm).all()):
+        return p, float("inf"), nfev, njev, -1
     lam, nu = 1e-3, 2.0
     D = None
     status = 0
+    rejects = 0
+    hist = [cost]
     while nfev < max_nfev:
         Jt, rt = scaled(r, Jm)
         g = Jt.T @ rt
@@ -742,11 +775,24 @@ def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4)
         if np.max(np.abs(g / D)) < gtol:
             status = 1
             break
+        if not (np.isfinite(H).all() and np.isfinite(g).all()):
+            break                                   # keep the last good p (its cost is finite)
         A = H + lam * np.diag(D * D)
         try:
             step = np.linalg.solve(A, -g)
         except np.linalg.LinAlgError:
-            step = np.linalg.lstsq(A, -g, rcond=None)[0]
+            try:
+                step = np.linalg.lstsq(A, -g, rcond=None)[0]
+            except np.linalg.LinAlgError:
+                step = None
+        if step is None or not np.isfinite(step).all():
+            lam *= nu; nu *= 2.0                    # treat as a rejected step: damp harder
+            nfev += 1
+            rejects += 1
+            if max_rejects is not None and rejects >= max_rejects:
+                status = 4
+                break
+            continue
         p_new = p + step
         r_new = fun(p_new)
         nfev += 1
@@ -759,14 +805,26 @@ def lm_solve(fun, jac, p0, C=3.0, max_nfev=200, ftol=1e-4, xtol=1e-7, gtol=1e-4)
             lam *= max(1.0 / 3.0, 1.0 - (2.0 * ratio - 1.0) ** 3)
             nu = 2.0
             fconv = actual < ftol * cost and ratio > 0.25
-            p, r, cost = p_new, r_new, c_new
-            Jm = jac(p); njev += 1
+            J_new = jac(p_new); njev += 1
+            if not np.isfinite(J_new).all():        # accept nothing whose Jacobian blew up
+                break
+            p, r, cost, Jm = p_new, r_new, c_new, J_new
+            rejects = 0
+            hist.append(cost)
             if fconv:
                 status = 2
+                break
+            if (stall_tol is not None and len(hist) > stall_steps
+                    and hist[-1 - stall_steps] - cost < stall_tol * hist[-1 - stall_steps]):
+                status = 4
                 break
         else:
             lam *= nu
             nu *= 2.0
+            rejects += 1
+            if max_rejects is not None and rejects >= max_rejects:
+                status = 4
+                break
         if np.linalg.norm(step) < xtol * (xtol + np.linalg.norm(p)):
             status = 3
             break

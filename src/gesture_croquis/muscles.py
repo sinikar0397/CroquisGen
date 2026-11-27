@@ -198,13 +198,13 @@ def stress_residuals(X, down, frames, angles, tau_by_joint):
     return np.array([g["stress"] for g in ms["groups"].values()]), ms
 
 
-def frame_stress(frame, contacts=None, mass=None):
+def frame_stress(frame, contacts=None, mass=None, g_scale=1.0):
     """Muscle stress of a PoseFrame (camera frame, its gravity direction and contacts)."""
     from .biomech import Physics, frames as body_frames, joint_angles, EFFORT_JOINTS
     X = frame.joints3d
     down = np.asarray(frame.gravity_dir, float)
     cs = [c for c in (contacts if contacts is not None else frame.contacts or []) if c in IDX]
-    ph = Physics(cs, frame.body_height_m, mass=mass)
+    ph = Physics(cs, frame.body_height_m, mass=mass, g_scale=g_scale)
     _, _, _, tau = ph.solve(X, down)
     ang = joint_angles(X, down)
     ang = ang[0] if isinstance(ang, tuple) else ang

@@ -297,20 +297,51 @@ Tests (`test_s4_gesture.py`, synthetic poses):
 python -m gesture_croquis.live --camera 0 --show
 python -m gesture_croquis.live --video clip.mp4 --out croquis.mp4 --overlay
 ```
+**Models** (printed at start; `--mode` picks the S1 pair):
+
+| | `lightweight` | `balanced` (default) | `performance` | runs |
+|---|---|---|---|---|
+| S1 detector (`--det-mode`, default `lightweight`) | YOLOX-tiny 416² | YOLOX-m 640² | YOLOX-x 640² | re-detection frames only (start, lost, every 90) |
+| S1 pose (Halpe-26) | RTMPose-s 256×192 | RTMPose-m 256×192 | RTMPose-x 384×288 | every frame, on the ROI |
+| S2 depth | RTMW3D-x 384×288 (rtmlib has no other size) | same | same | keyframes only, in the worker |
+
+**The loop** (`_loop`) times every part: capture, S1–S4, draw, output, and on a camera the capture-to-shown delay. Drawing happens at `--preview-width` (960 px), with the overlay blended in uint8 at that size. On a camera, a reader thread keeps only the newest frame (`LatestFrame`), so the delay stays about one processing time instead of a growing queue; skipped stale frames are counted. Video files are processed frame by frame.
 **S1, ROI tracking.**
 - The person detector (YOLOX) runs only without a track, after the track is lost, or every `redetect_every` frames (90) as a safety net. Otherwise RTMPose runs on a box grown 25% around the previous frame's confident keypoints, and by another 50% when a joint comes near the box edge.
 - **"Lost" has hysteresis:** the core-joint confidence must stay below 0.30 for two frames to count as lost, and rise above 0.45 to count as found.
 - A One-Euro filter on the keypoints removes jitter without lagging fast motion.
 
-**S2, tracking.** `Lifter3D.track()` runs one physical fit warm-started from the previous frame's skeleton, fitted height and proportions (`fit_skeleton(scales_p0=...)`) and camera pitch. No detector, no RTMW3D, no label or flip search.
+**Fast motion and camera movement** (added after the first real-camera test lagged badly):
+- **Predictive ROI:** the box moves ahead by the person's velocity and grows with the expected motion.
+- **Same-frame re-detection:** if the ROI result is poor (core joints missing), S1 re-runs with the detector *on the same frame*. It no longer waits two frames.
+- **Small re-detection detector:** YOLOX-tiny by default (`--det-mode`), while RTMPose stays at `--mode`. The detector runs rarely, but always on the fastest frames.
+- **Never blocking with a track:** re-acquisition no longer runs a synchronous full re-solve, which in the throttled worker took a second or more. It uses the aligned tracked fit and asks the worker for a re-solve in the background. Only the very first frame blocks.
+- **No-person frames:** a frame with no usable person keeps the last croquis (`kind="no-person"`). Before, S4 raised and the loop crashed.
+
+**S2, tracking.** `Lifter3D.track()` runs one physical fit warm-started from the previous frame's skeleton, fitted height and proportions (`fit_skeleton(scales_p0=...)`) and camera pitch. No detector, no RTMW3D, no label or flip search. The warm start follows the motion first:
+- `_aligned`: the previous pose is moved, and its depth scaled, so its **torso** (shoulders + hips, nearly rigid) projects onto the new keypoints. Size changes under 15% are ignored. Using knees and ankles for the size made the depth wobble with the pose (frame-to-frame jitter 2.6 cm against a true 1.9 cm).
+- `_on_rays`: a joint more than 3% of the person's height off its new keypoint, or one that just reappeared, keeps its depth but moves onto its new camera ray. A reappearing joint takes its parent's depth. Before this, a joint "parked" on a neighbour for one frame stayed 90–130 px off for several frames.
+
+Synthetic stress test (fast motion, ±250 px camera pan, every 3rd frame), against the previous version:
+
+| | degraded frames | pose error | S2 |
+|---|---|---|---|
+| previous warm start | 26 of 60 | 11.3 cm | 92 ms |
+| aligned + on-ray warm start | 5 of 60 | 7.3 cm | 64 ms |
+
+On the smooth clip the new warm start adds no jitter: 1.79 cm frame-to-frame motion against a true 1.90 cm; worst jump 8 cm, previously 11 cm.
 - **Contact hysteresis** (`choose_contacts(prev=...)`): a foot in contact stays in contact until it is 8 cm above the floor; new contacts still need the usual entry rule.
 
 **S2, keyframes.**
-- **When:** every `keyframe_every` frames (30), after re-detection, or when the tracked fit degrades. "Degrades" means a median 2D error above 12 px, one joint more than 48 px off, or the energy jumping ×2.5 from one frame to the next. The energy *level* is not a trigger, because a harder pose (sinking into a lunge) raises it legitimately.
-- **How:** the full re-solve (RTMW3D depth, both depth signs, label swaps, flip search) runs in a separate worker **process**. In a thread it shared Python's global interpreter lock with the frame loop: p95 frame time 302 ms, against 95–100 ms in a process. RTMW3D loads only in the worker.
+- **When:** every `keyframe_every` frames (30), after re-detection, or when the tracked fit degrades. "Degrades" means a median 2D error above 2% of the person's height in the image, one joint more than 10% off, or the energy jumping ×2.5 from one frame to the next. The energy *level* is not a trigger, because a harder pose (sinking into a lunge) raises it legitimately. (The first version used fixed pixel thresholds of 12/48 px. On a real webcam image those fired on 331 of 428 frames and kept the worker permanently busy.)
+- **How:** the full re-solve (RTMW3D depth, both depth signs, label swaps, flip search) runs in a separate worker **process**, at low priority (`nice 10`) and capped to `--worker-threads` (2) XLA / ONNX Runtime threads. In a thread it shared Python's global interpreter lock with the frame loop: p95 frame time 302 ms, against 95–100 ms in a process. RTMW3D loads only in the worker.
 - **Hysteresis:** the current track joins the re-solve as a candidate, with its energy discounted by `track_bonus` (15%). When the result arrives, a winner that isn't the track is re-fitted to the *current* frame. It replaces the track only if it beats the track there by 15% as well. Two nearly equal readings therefore do not flip back and forth.
 - Without `track_bonus`, the synthetic test sequence switched twice, with a worst jump of 14 cm between frames; with it, never.
 - Because the worker re-imports the calling script, that script needs an `if __name__ == "__main__":` guard. `LiveConfig(async_keyframes=False)` runs keyframes in the frame loop instead, with stalls.
+
+**Dynamic by default.** Video runs without the static-balance and level-floor priors (`Lifter3D(dynamic=True)`), because a moving person is not in static equilibrium. `--static` restores them for held poses.
+- **Foot contacts:** a foot counts as planted when it is within ~4 cm of the lowest foot point (in static mode, within 15 cm). In live mode it then stays planted until it rises 8 cm.
+- **Limitation:** the lowest foot point always defines the floor, so a jump is not detected. Tracking the floor height over time (the camera is fixed) is the next step.
 
 **S3 and S4** run on every frame. The line-of-action chain has hysteresis too (`S4Params.loa_hysteresis`, 15%; `build_croquis(prefer_loa=...)`).
 
@@ -321,6 +352,7 @@ python -m gesture_croquis.live --video clip.mp4 --out croquis.mp4 --overlay
 
 **Not covered yet:**
 - Occlusion constraints are computed on keyframes only and not carried into the track.
+- All tests use synthetic keypoints; real-camera timings need a run on the Mac (the CLI prints them).
 - One person per stream.
 - The app's `renderer.py` still feeds MediaPipe landmarks to S4 in 2D mode and is declared `stateless`. Switching it to `LivePipeline` needs the camera frames and one long-lived pipeline instance in the app loop.
 

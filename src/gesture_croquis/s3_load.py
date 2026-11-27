@@ -127,8 +127,11 @@ def _support_offset(points_xz, p):
     return float(min(d))
 
 
-def static_load(frame, body_mass=None, contacts=None, sagittal=0.0):
-    """Fill frame.spine3d / com3d / contacts / joint_torque / joint_effort / muscle_stretch / s3_info."""
+def static_load(frame, body_mass=None, contacts=None, sagittal=0.0, g_scale=1.0):
+    """Fill frame.spine3d / com3d / contacts / joint_torque / joint_effort / muscle_stretch / s3_info.
+    contacts=None: detected here (lowest foot points). contacts=[] with g_scale=0: flight (video,
+    tracked floor): no ground reaction and no gravity load in the body frame (free fall), so the
+    remaining stress is the passive length state alone."""
     H = frame.body_height_m
     body_mass = body_mass or 22.0 * H * H                       # BMI 22 default
     v = frame.valid3d
@@ -151,7 +154,10 @@ def static_load(frame, body_mass=None, contacts=None, sagittal=0.0):
     R, cop = distribute_reactions(W, contacts, com, body_mass * G)
     offset = off(contacts) if contacts else None
 
-    forces = [(p, -UP * mk * G, seg) for seg, (p, mk) in m.items()]           # gravity
+    ge = G * g_scale                                                # effective gravity
+    if R:
+        R = {c_: f * g_scale for c_, f in R.items()}
+    forces = [(p, -UP * mk * ge, seg) for seg, (p, mk) in m.items()]          # gravity
     owner = {pt: seg for seg, pts in SEG_POINTS.items() for pt in pts}
     forces += [(W[IDX[c]], UP * f, owner.get(c, "lower_trunk")) for c, f in R.items()]   # reactions
 
@@ -201,7 +207,8 @@ def static_load(frame, body_mass=None, contacts=None, sagittal=0.0):
                                   norm=float(np.linalg.norm(t))) for j, t in torque.items()}
     frame.joint_effort = {j: e / mx for j, e in effort.items()}
     frame.muscle_stretch = {k: (float(v_) if not isinstance(v_, str) else v_) for k, v_ in st.items()}
-    frame.s3_info = dict(body_mass_kg=float(body_mass), contacts_auto=auto, contacts_added_for_balance=added,
+    frame.s3_info = dict(body_mass_kg=float(body_mass), contacts_auto=auto, g_scale=float(g_scale),
+                         airborne=bool(not contacts and g_scale == 0.0), contacts_added_for_balance=added,
                          reactions_N={c: round(f, 1) for c, f in R.items()},
                          com_world=com.round(3).tolist(), cop_world=None if cop is None else cop.round(3).tolist(),
                          com_offset_m=offset, balanced=(offset is not None and offset < 0.03),
@@ -211,7 +218,7 @@ def static_load(frame, body_mass=None, contacts=None, sagittal=0.0):
     # ---- unified muscle effort-stress (gravity demand + length state) ------------------
     try:
         from .muscles import frame_stress
-        ms = frame_stress(frame, mass=body_mass)
+        ms = frame_stress(frame, mass=body_mass, g_scale=g_scale)
         frame.s3_info.update(stress_index=round(ms["index"], 3), stress_peak=round(ms["peak"], 3),
                              muscle_stress={k: {kk: round(vv, 3) if isinstance(vv, float) else vv
                                                 for kk, vv in g.items()} for k, g in ms["groups"].items()},

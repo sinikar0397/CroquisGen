@@ -895,9 +895,13 @@ def build_croquis(frame, view: View | None = None, params: S4Params | None = Non
     lap("construction")
     strokes = [s for s in strokes if s.layer in layers]
     assign_weights(strokes, b, prm, S); lap("weights")
+    lim = 4.0 * float(max(*tuple(getattr(frame, "img_hw", None) or (0, 0)), 1e3))                 # a stroke this far off the canvas is a diverged fit
+    bad = [s.name for s in strokes if not (np.isfinite(s.pts).all() and np.isfinite(s.width).all()
+                                           and np.abs(s.pts).max() < lim and s.width.max() < lim)]
+    strokes = [s for s in strokes if s.name not in bad]   # never hand NaN geometry to a renderer
     tm["total"] = round(sum(tm.values()), 2)
     s3 = frame.s3_info or {}
-    info = dict(mode=b.mode, unit_px=round(S, 3), support={k: round(v, 3) for k, v in b.support.items()},
+    info = dict(mode=b.mode, unit_px=round(S, 3), dropped_nonfinite=bad, support={k: round(v, 3) for k, v in b.support.items()},
                 com_offset_m=s3.get("com_offset_m"), balanced=s3.get("balanced"),
                 airborne=not bool(frame.contacts) if b.mode == "3d" else None,
                 torso=torso_info, layers=layers, timings_ms=tm, exaggeration=prm.exaggeration,
@@ -952,12 +956,13 @@ def _draw_stroke(img, pts, w, color, closed):
     for k in np.unique(joins):
         r = w[k] / 2
         if r > 0.6:
-            cv2.circle(img, tuple(np.round(P[k] * 16).astype(int)), int(round(r * 16)), color, -1,
+            c = np.clip(np.round(P[k] * 16), -2**27, 2**27)
+            cv2.circle(img, (int(c[0]), int(c[1])), int(min(round(r * 16), 2**27)), color, -1,
                        cv2.LINE_AA, shift=4)
 
 
 def render_preview(c: Croquis, size=None, bg=None, fit=True, margin=0.08, supersample=2,
-                   layers=None, color=None, loa_color=LOA_COLOR):
+                   layers=None, color=None, loa_color=LOA_COLOR, view_scale=1.0):
     """Rasterise the strokes. size=(H,W): output canvas (default: the view canvas). fit=True scales
     the drawing into the canvas; fit=False keeps view px (overlay on the photo, pass it as bg).
     color recolours the other strokes; the line of action (layer A) is drawn in loa_color
@@ -973,14 +978,17 @@ def render_preview(c: Croquis, size=None, bg=None, fit=True, margin=0.08, supers
         span = np.maximum(hi - lo, 1e-6)
         sc = min((W * (1 - 2 * margin)) / span[0], (H * (1 - 2 * margin)) / span[1])
         off = np.array([W, H]) / 2 - sc * (lo + hi) / 2
-    else:
-        sc, off = 1.0, np.zeros(2)
+    else:                                     # view px, optionally scaled (e.g. a smaller live preview)
+        sc, off = float(view_scale), np.zeros(2)
     if bg is None:
         canvas = np.full((H * ss, W * ss, 3), 250, np.uint8)
     else:
         canvas = cv2.resize(bg, (W * ss, H * ss), interpolation=cv2.INTER_LINEAR)
     order = sorted(strokes, key=lambda s: {"C": 0, "B": 1, "A": 2}[s.layer])
     for s in order:
+        if not (np.isfinite(s.pts).all() and np.isfinite(s.width).all()
+                and np.abs(s.pts).max() < 4 * max(H, W) and s.width.max() < 4 * max(H, W)):
+            continue                                    # a degenerate / off-canvas stroke is skipped
         col = (loa_color or color or INK["A"]) if s.layer == "A" else (color or INK[s.layer])
         _draw_stroke(canvas, (s.pts * sc + off) * ss, np.maximum(s.width * sc * ss, 0.0), col, s.closed)
     return cv2.resize(canvas, (W, H), interpolation=cv2.INTER_AREA)
