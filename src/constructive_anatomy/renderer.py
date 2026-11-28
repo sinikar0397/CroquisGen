@@ -340,23 +340,54 @@ def _add_slab(scene, depth, poly, offset, thick, size, extra=None):
     scene.add(depth, lambda c: cv2.fillPoly(c, [outline], PAPER, cv2.LINE_8), stroke)
 
 
-def _add_ellipsoid(scene, depth, centre, up, half_w, half_h, depth_r, facing, thick, thin,
-                   ring_at, ring_squash, ring_toward):
-    # 타원체 = 윤곽 + 중심선(카메라 향한 쪽으로 쏠림) + 가로 단면선 하나
-    # facing = right 방향 sin(yaw). 돌아선 만큼 폭이 depth_r 쪽으로 바뀌고 중심선이 옆으로 간다
+_RING = np.array([(1, .55), (.55, 1), (-.55, 1), (-1, .55), (-1, -.55), (-.55, -1), (.55, -1), (1, -.55)],
+                 np.float32)  #모서리를 깎은 직사각형 단면 (x=오른쪽, z=카메라 쪽). 정면에서도 옆 띠가 보임
+
+
+def _add_block(scene, depth, centre, up, half_w, half_h, depth_r, facing, tilt, thick, thin, *,
+               top=1.0, bottom=1.0, extra=None):
+    # 모서리 깎은 직육면체. facing = sin(yaw), tilt = sin(앞뒤 기울기, +면 윗면이 카메라 쪽)
+    # top/bottom은 위아래 단면 배율 (흉곽은 아래가 좁고 골반은 위가 넓은 식)
     right = np.array([-up[1], up[0]], dtype=np.float32)
-    facing = max(-1.0, min(1.0, facing))
-    proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth_r ** 2 * facing ** 2)
-    angle = math.degrees(math.atan2(float(right[1]), float(right[0])))
-    side = 1.0 if facing >= 0 else -1.0
+    ring = _RING * (half_w, depth_r)
+    verts = np.vstack([np.column_stack([ring[:, 0] * top, np.full(8, half_h), ring[:, 1] * top]),
+                       np.column_stack([ring[:, 0] * bottom, np.full(8, -half_h), ring[:, 1] * bottom])])
+    edges = np.roll(ring, -1, axis=0) - ring
+    normals = np.vstack([np.column_stack([edges[:, 1], np.zeros(8), -edges[:, 0]]),  #옆면 8개
+                         [(0, 1, 0), (0, -1, 0)]])  #윗면, 아랫면
+    sy, cy = max(-1.0, min(1.0, facing)), math.sqrt(max(0.0, 1 - facing ** 2))
+    st, ct = max(-1.0, min(1.0, tilt)), math.sqrt(max(0.0, 1 - tilt ** 2))
+    rot = np.array([[1, 0, 0], [0, ct, -st], [0, st, ct]]) @ np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
 
-    def lines(c, ink, ghost):
-        _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin, ink,
-                      full=ghost)
-        _half_ellipse(c, centre + up * (half_h * ring_at), up * ring_toward,
-                      max(proj_w * ring_squash, proj_w * 0.12), proj_w, thin, ink, full=ghost)
+    def proj(p):  #local 3D -> 화면
+        x, y, _ = rot @ np.asarray(p, dtype=np.float64)
+        return centre + right * x + up * y
 
-    _add_ellipse(scene, depth, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
+    scr = np.array([proj(v) for v in verts], np.float32)
+    seen = (normals @ rot.T)[:, 2] > 0
+    hull = cv2.convexHull(scr).astype(np.int32)
+    creases = []  #보이는 두 면 사이 모서리. 한 면만 보이면 실루엣이라 hull이 그리고, 뒷면 모서리는 안 그림(선이 너무 많아짐)
+    for i in range(8):
+        j = (i + 1) % 8
+        for a, b, faces in ((i, j, (8, i)), (8 + i, 8 + j, (9, i)), (i, 8 + i, (i - 1, i))):
+            if seen[faces[0]] and seen[faces[1]]:
+                creases.append((a, b))
+
+    def stroke(c, ink, ghost):
+        cv2.polylines(c, [hull], True, ink, thick, cv2.LINE_AA)
+        for a, b in creases:
+            cv2.line(c, _pt(scr[a]), _pt(scr[b]), ink, thin, cv2.LINE_AA)
+        if extra:
+            extra(c, ink, ghost, proj, bool(seen[1]))  #1번 옆면이 앞면
+
+    scene.add(depth, lambda c: cv2.fillPoly(c, [hull], PAPER, cv2.LINE_8), stroke)
+
+
+def _front_line(a, b):  #블록 앞면 위의 선 (local 3D 두 점). 앞면이 보이거나 고스트일 때만
+    def draw(c, ink, ghost, proj, front, thin):
+        if front or ghost:
+            cv2.line(c, _pt(proj(a)), _pt(proj(b)), ink, thin, cv2.LINE_AA)
+    return draw
 
 
 def _base_edge(points, chain, r, order):  #마디 첫 원기둥의 밑동 양 끝점. order 방향으로 정렬
@@ -503,20 +534,33 @@ class ConstructiveRenderer:
             toward_b = float(depth[a] - depth[b]) / d
             return toward_b * (1.0 if float(np.dot(ab, right)) >= 0 else -1.0)
 
-        # 앞뒤로 숙이면 가로 단면이 벌어져 보임
+        # 앞뒤로 숙인 정도. +면 골반이 멀다 = 윗면이 카메라 쪽으로 기움
         z_shoulders = float(depth[L_SHOULDER] + depth[R_SHOULDER]) / 2
         z_hips = float(depth[L_HIP] + depth[R_HIP]) / 2
         dz = z_hips - z_shoulders
-        pitch = abs(dz) / math.hypot(length, dz)
-        ring_toward = -1.0 if dz > 0 else 1.0  #보이는 반쪽은 가까운 끝 반대편
+        tilt = dz / math.hypot(length, dz)
 
-        # 흉곽과 골반을 따로. 허리에서 비틀리는 게 보여야 하니까
-        _add_ellipsoid(scene, z_shoulders, shoulders + spine * 0.34, up, H * 0.72, H * 0.85,
-                       H * 0.55, facing(L_SHOULDER, R_SHOULDER), thick, thin,
-                       ring_at=-0.6, ring_squash=pitch, ring_toward=ring_toward)
-        _add_ellipsoid(scene, z_hips, shoulders + spine * 0.86, up, H * 0.60, H * 0.45,
-                       H * 0.50, facing(L_HIP, R_HIP), thick, thin,
-                       ring_at=0.0, ring_squash=pitch, ring_toward=ring_toward)
+        def sternum(hh, d, bottom):  #앞면 중심선
+            line = _front_line((0, hh, d), (0, -hh, d * bottom))
+            return lambda c, ink, ghost, proj, front: line(c, ink, ghost, proj, front, thin)
+
+        # 흉곽과 골반을 따로. 허리에서 비틀리는 게 보여야 하니까. 흉곽은 아래가 좁고 골반은 위가 넓게
+        # 흉곽 윗면은 어깨 관절보다 0.1H 위 (쇄골 높이). 어깨 점까지 내리면 목이 너무 길어 보임
+        notch = (0, H * 0.75, H * 0.50 * 0.9)  #목 아래 오목한 곳 (앞면 위, 어깨 관절 높이)
+        breastbone = _front_line(notch, (0, -H * 0.85, H * 0.50 * 0.78))
+
+        def ribcage_lines(c, ink, ghost, proj, front):
+            breastbone(c, ink, ghost, proj, front, thin)
+            if front or ghost:  #쇄골: 오목한 곳에서 양 어깨 관절로
+                for sh in (L_SHOULDER, R_SHOULDER):
+                    cv2.line(c, _pt(proj(notch)), _pt(points[sh]), ink, thin, cv2.LINE_AA)
+
+        _add_block(scene, z_shoulders, shoulders + spine * 0.30, up, H * 0.68, H * 0.85, H * 0.50,
+                   facing(L_SHOULDER, R_SHOULDER), tilt, thick, thin, top=0.92, bottom=0.78,
+                   extra=ribcage_lines)
+        _add_block(scene, z_hips, shoulders + spine * 0.86, up, H * 0.58, H * 0.42, H * 0.46,
+                   facing(L_HIP, R_HIP), tilt, thick, thin, bottom=0.85,
+                   extra=sternum(H * 0.42, H * 0.46, 0.85))
 
     def _head(self, scene, points, depth, result, shoulders, up, H, thick, thin):
         if visible(result, L_EAR, R_EAR):
@@ -528,25 +572,28 @@ class ConstructiveRenderer:
         else:
             return
         right = np.array([-up[1], up[0]], dtype=np.float32)
-        half_w, half_h, depth_r = H * 0.37, H * 0.5, H * 0.45
+        half_w, half_h, depth_r, jaw = H * 0.40, H * 0.5, H * 0.45, 0.78  #턱 쪽이 좁은 블록
 
-        # 얼굴 중심선은 코 위치로 바로 정함 (yaw 추정 필요 없음)
-        offset = float(np.dot(points[NOSE] - centre, right)) if visible(result, NOSE) else 0.0
-        facing = max(-1.0, min(1.0, offset / depth_r))
-        proj_w = math.sqrt(half_w ** 2 * (1 - facing ** 2) + depth_r ** 2 * facing ** 2)
-        angle = math.degrees(math.atan2(float(right[1]), float(right[0])))
-        side = 1.0 if offset >= 0 else -1.0
+        # 얼굴 중심선은 코 위치로 바로 정함 (yaw 추정 필요 없음). 코가 귀보다 많이 내려가면 숙인 것
+        nose = points[NOSE] - centre if visible(result, NOSE) else None
+        facing = max(-1.0, min(1.0, float(np.dot(nose, right)) / depth_r)) if nose is not None else 0.0
+        tilt = (max(-0.6, min(0.6, -(float(np.dot(nose, up)) + H * 0.17) / (H * 0.5)))
+                if nose is not None else 0.0)  #바로 볼 때 코는 귀보다 0.17H 아래
         eye_level = (float(np.dot((points[L_EYE] + points[R_EYE]) / 2 - centre, up))
                      if visible(result, L_EYE, R_EYE) else None)
+        face_lines = [_front_line((0, half_h, depth_r * 0.9), (0, -half_h, depth_r * jaw))]
+        if eye_level is not None:
+            y = max(-half_h, min(half_h, eye_level))
+            k = jaw + (0.9 - jaw) * (y + half_h) / (2 * half_h)  #그 높이의 앞면 폭 배율
+            face_lines.append(_front_line((-half_w * 0.55 * k, y, depth_r * k),
+                                          (half_w * 0.55 * k, y, depth_r * k)))
 
-        def lines(c, ink, ghost):
-            _half_ellipse(c, centre, right * side, abs(facing) * depth_r, half_h, thin, ink,
-                          full=ghost)
-            if eye_level is not None:
-                _half_ellipse(c, centre + up * eye_level, -up, proj_w * 0.18, proj_w * 0.95,
-                              thin, ink, full=ghost)
+        def lines(c, ink, ghost, proj, front):
+            for line in face_lines:
+                line(c, ink, ghost, proj, front, thin)
 
-        _add_ellipse(scene, z, centre, _axes(proj_w, half_h), angle, thick, extra=lines)
+        _add_block(scene, z, centre, up, half_w, half_h, depth_r, facing, tilt, thick, thin,
+                   top=0.9, bottom=jaw, extra=lines)
 
         # 목. 머리가 어깨에서 1.5H 넘게 떨어져 있으면 검출이 이상한 거라 안 그림
         if np.linalg.norm(centre - shoulders) <= H * 1.5:
